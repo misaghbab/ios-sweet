@@ -1,0 +1,44 @@
+From: alioth bring-up
+Subject: [PATCH] alioth: accept hardware-gated AHB clock status
+
+A device video shows S_AHB=0x80000002 after enabling all three clock
+votes. gcc-kona.c sets hwcg_bit=1 for this branch. clk-branch.c
+skips halt polling while HWCG is active, so bit 31 alone must not
+abort the probe. Match that rule and the branch2 NOC-on acceptance.
+Require clock votes to read back; retain guards for non-HWCG clocks.
+No new MMIO writes, pin changes or SPI transfers are introduced.
+
+--- a/bsd/dev/sweet_alitouch.h
++++ b/bsd/dev/sweet_alitouch.h
+@@ -61,6 +61,14 @@
+ 	    io, io & 1u, (io >> 1) & 1u);
+ }
+ 
++/* Same halt acceptance as clk-branch.c: HWCG branches may idle-gate. */
++static bool
++ali_clock_ready(uint32_t status, bool hwcg)
++{
++	return hwcg || !(status & (1u << 31)) ||
++	    (status & 0xf0000000u) == 0x20000000u;
++}
++
+ static void
+ ali_thread(void *arg, wait_result_t result)
+ {
+@@ -105,8 +113,14 @@
+ 	    ali_rd(ali_gcc, ALI_RCG + 8u), ali_rd(ali_gcc, ALI_RCG + 0xcu),
+ 	    ali_rd(ali_gcc, ALI_RCG + 0x10u), ali_rd(ali_gcc, ALI_RCG + 0x14u),
+ 	    ali_rd(ali_gcc, ALI_RCG + 0x1cu));
+-	if ((hs4 | hm | hs) & (1u << 31)) {
+-		printf("ALITOUCH: a clock is still off; NOT touching SE4 registers\n");
++	uint32_t vote_after = ali_rd(ali_gcc, ALI_GCC_VOTE);
++	bool sahb_hwcg = (hs & (1u << 1)) != 0;
++	printf("ALITOUCH: s_ahb hwcg=%u (CLK_OFF alone is not failure in HWCG mode)\n",
++	    (unsigned)sahb_hwcg);
++	if ((vote_after & ALI_VOTE_BITS) != ALI_VOTE_BITS ||
++	    !ali_clock_ready(hs4, false) || !ali_clock_ready(hm, false) ||
++	    !ali_clock_ready(hs, sahb_hwcg)) {
++		printf("ALITOUCH: clock vote/status not ready; NOT touching SE4 registers\n");
+ 		goto out;
+ 	}
+ 
