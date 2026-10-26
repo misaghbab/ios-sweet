@@ -1,0 +1,286 @@
+From: alioth bring-up
+Subject: [PATCH] alioth: poll CRC-checked FT5652 reports and deliver HID contacts
+
+Opt-in alitouch=3 retains stage B power/setup and requires its CRC-valid
+5652 identification before starting report polling. Stream 71-byte reads
+through the 16-word FIFO with bounded RX/TX counts and timeout quarantine.
+Validate CRC, status, IDs, event flags, count and raw coordinate bounds
+before delivering ten possible contacts through existing SweetHID mapping.
+Release absent contacts, tolerate transient invalid frames, release after
+five consecutive invalid reports and keep polling with backoff. Limit logs.
+No IC writes, firmware upload, DMA, GIC changes or partition operations.
+Stages1/2 and existing console suppression remain available unchanged.
+Physical report/HID behavior requires a full kernel build and device test.
+
+diff --git a/bsd/dev/sweet_alitouch.h b/bsd/dev/sweet_alitouch.h
+--- a/bsd/dev/sweet_alitouch.h
++++ b/bsd/dev/sweet_alitouch.h
+@@ -2,7 +2,8 @@
+  * ALIOTOUCH stage A (POCO F3 / alioth, SM8250): diagnostics for the
+  * FocalTech FT3658U touch controller on GENI SE4 (SPI, 0x990000).
+  *
+- * Included from sweet_touch.c; alitouch=1 probes, alitouch=2 also runs stage B.
++ * Included from sweet_touch.c; alitouch=1 probes, alitouch=2 runs stage B,
++ * alitouch=3 also polls CRC-checked touch reports and dispatches HID events.
+  * Stage A ONLY ORs the three QUP0 clock-vote bits (S4, M_AHB, S_AHB) into
+  * GCC_QUPV3_WRAP_0_CLK_ENA (0x52008), exactly what Linux does. No TLMM
+  * writes, no RPMh votes, no SPI traffic, no GENI register writes in stage A.
+@@ -71,6 +72,7 @@
+ }
+ 
+ #include "sweet_alispi.h"
++#include "sweet_alireport.h"
+ 
+ static void
+ ali_thread(void *arg, wait_result_t result)
+@@ -148,8 +150,11 @@
+ 	    ali_rd(ali_se, 0x224), ali_rd(ali_se, 0x230), ali_rd(ali_se, 0x25c),
+ 	    ali_rd(ali_se, 0x268), ali_rd(ali_se, 0x258));
+ 	printf("ALITOUCH: stage A done\n");
+-	if (stage == 2) {
+-		ali_stage_b();
++	if (stage == 2 || stage == 3) {
++		bool identified = ali_stage_b();
++		if (identified && stage == 3) {
++			ali_touch_poll();
++		}
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());
+diff --git a/bsd/dev/sweet_alispi.h b/bsd/dev/sweet_alispi.h
+--- a/bsd/dev/sweet_alispi.h
++++ b/bsd/dev/sweet_alispi.h
+@@ -272,29 +272,29 @@
+ 	return EIO;
+ }
+ 
+-static void
++static bool
+ ali_stage_b(void)
+ {
+ 	printf("ALITOUCH: stage B begin (power/reset/SPI ID only)\n");
+ 	if (!as_preflight()) {
+-		return;
++		return false;
+ 	}
+ 	if (!as_reset(false)) {
+ 		printf("ALITOUCH: reset-low readback failed; power skipped\n");
+-		return;
++		return false;
+ 	}
+ 	ali_wait(2);
+ 	int error = alioth_rpmh_touch_power();
+ 	if (error) {
+ 		printf("ALITOUCH: stage B power failed=%d; reset held low, SPI skipped\n", error);
+-		return;
++		return false;
+ 	}
+ 	ali_wait(10);
+ 	if (!as_setup() || !as_pins() || !as_reset(true)) {
+ 		printf("ALITOUCH: stage B setup/pin/reset readback failed\n");
+ 		ali_wr(ali_se, AS_M_EN, 0);
+ 		(void)as_reset(false);
+-		return;
++		return false;
+ 	}
+ 	ali_wait(300); /* exceeds vendor reset-to-ready delay */
+ 	uint8_t hi = 0, lo = 0;
+@@ -306,4 +306,5 @@
+ 	printf("ALITOUCH: stage B ID=%02x%02x expected=5652 error=%d match=%u\n",
+ 	    hi, lo, error, (unsigned)(!error && hi == 0x56 && lo == 0x52));
+ 	/* A successful ID proves the bus only. No touch events are injected here. */
+-}
++	return !error && hi == 0x56 && lo == 0x52;
++}
+diff --git a/bsd/dev/sweet_alireport.h b/bsd/dev/sweet_alireport.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_alireport.h
+@@ -0,0 +1,187 @@
++/* Alioth stage C: read-only FT5652 reports, enabled only by alitouch=3.
++ * SPI is polled; no firmware writes, DMA or CPU interrupts are introduced.
++ */
++#define AR_DATA 62u
++#define AR_WIRE (AR_DATA + 9u)
++
++struct ar_frame {
++	unsigned mask;
++	int x[10], y[10];
++};
++
++/* The 71-byte transaction exceeds the 64-byte FIFO. Drain RX before
++ * refilling TX, and bound every count and the complete command lifetime.
++ */
++static int
++ar_transfer(uint8_t rx[AR_WIRE])
++{
++	const uint8_t tx[AR_WIRE] = {1, 0xa0, 0, AR_DATA};
++	unsigned sent = 0, received = 0;
++	uint32_t irq = 0;
++	if (as_poisoned || (ali_rd(ali_se, AS_STATUS) & AS_ACTIVE) ||
++	    (ali_rd(ali_se, AS_TX_STATUS) & 0xfffffff) ||
++	    (ali_rd(ali_se, AS_RX_STATUS) & 0x1ffffff)) {
++		return EBUSY;
++	}
++	ali_wr(ali_se, AS_M_CLEAR, 0xffffffffu);
++	ali_wr(ali_se, 0x26c, AR_WIRE);
++	ali_wr(ali_se, 0x270, AR_WIRE);
++	ali_wr(ali_se, AS_M_CMD, 3u << 27);
++	for (unsigned us = 0; us < AS_TIMEOUT_US; ++us) {
++		irq = ali_rd(ali_se, AS_M_IRQ);
++		if (irq & AS_ERRORS) {
++			break;
++		}
++		uint32_t rs = ali_rd(ali_se, AS_RX_STATUS);
++		unsigned wc = rs & 0x1ffffffu, last = (rs >> 28) & 7u;
++		if (wc > AS_FIFO_WORDS || (wc && (rs & (1u << 31)) && last > 4)) {
++			break;
++		}
++		for (unsigned w = 0; w < wc; ++w) {
++			unsigned n = ((rs & (1u << 31)) && w + 1 == wc && last) ? last : 4;
++			if (n > AR_WIRE - received) {
++				goto fault;
++			}
++			uint32_t word = ali_rd(ali_se, AS_RX);
++			for (unsigned j = 0; j < n; ++j) {
++				rx[received++] = (uint8_t)(word >> (8 * j));
++			}
++		}
++		unsigned used = ali_rd(ali_se, AS_TX_STATUS) & 0xfffffff;
++		if (used > AS_FIFO_WORDS) {
++			break;
++		}
++		if (irq & AS_DONE) {
++			if (sent != AR_WIRE || received != AR_WIRE || used ||
++			    (ali_rd(ali_se, AS_STATUS) & AS_ACTIVE)) {
++				break;
++			}
++			ali_wr(ali_se, AS_M_CLEAR, irq);
++			delay(150);
++			return 0;
++		}
++		for (; used < AS_FIFO_WORDS && sent < AR_WIRE; ++used) {
++			uint32_t word = 0;
++			for (unsigned j = 0; j < 4 && sent < AR_WIRE; ++j) {
++				word |= (uint32_t)tx[sent++] << (8 * j);
++			}
++			ali_wr(ali_se, AS_TX, word);
++		}
++		delay(1);
++	}
++fault:
++	printf("ALITOUCH: report transport fault irq=%#x sent=%u received=%u\n",
++	    irq, sent, received);
++	as_stop();
++	return EIO;
++}
++
++static bool
++ar_decode(const uint8_t rx[AR_WIRE], struct ar_frame *out)
++{
++	struct ar_frame frame = {0};
++	unsigned seen = 0, active = 0;
++	if ((rx[3] & 0xa0) || as_crc(rx + 7, AR_DATA) !=
++	    ((uint16_t)rx[69] | ((uint16_t)rx[70] << 8))) {
++		return false;
++	}
++	/* Linux reads register01 into report+1; count is report[2]. */
++	unsigned count = rx[8] & 15u;
++	if (count > 10) {
++		return false;
++	}
++	for (unsigned i = 0; i < 10; ++i) {
++		const uint8_t *p = rx + 9 + 6 * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= 10) {
++			break;
++		}
++		if ((seen & (1u << id)) || event == 3) {
++			return false;
++		}
++		seen |= 1u << id;
++		if (event == 1) {
++			continue;
++		}
++		unsigned x = ((p[0] & 15u) << 11) | (p[1] << 3) | (p[4] >> 5);
++		unsigned y = ((p[2] & 15u) << 11) | (p[3] << 3) | ((p[4] >> 2) & 7u);
++		if (x >= 8640 || y >= 19200) {
++			return false;
++		}
++		frame.mask |= 1u << id;
++		frame.x[id] = (int)(x / 8);
++		frame.y[id] = (int)(y / 8);
++		++active;
++	}
++	if (active != count) {
++		return false;
++	}
++	*out = frame; /* Never dispatch a partially validated report. */
++	return true;
++}
++
++static void
++ar_dispatch(struct ar_frame *previous, const struct ar_frame *next)
++{
++	for (unsigned id = 0; id < 10; ++id) {
++		if ((previous->mask & ~next->mask) & (1u << id)) {
++			sweet_hid_touch((int)id, 0, previous->x[id], previous->y[id]);
++		}
++	}
++	for (unsigned id = 0; id < 10; ++id) {
++		if (next->mask & (1u << id)) {
++			/* SweetHID deduplicates unchanged positions, and maps panel pixels
++			 * to logical display coordinates. Reoffer if it was not ready yet.
++			 */
++			sweet_hid_touch((int)id, 1, next->x[id], next->y[id]);
++		}
++	}
++	*previous = *next;
++}
++
++static void
++ali_touch_poll(void)
++{
++	struct ar_frame previous = {0}, empty = {0};
++	unsigned failures = 0, diagnostics = 0;
++	bool first = true, first_contact = true;
++	ali_wr(ali_se, AS_M_EN, AS_IRQ_MASK);
++	printf("ALITOUCH: stage C report polling started (71-byte FIFO, HID)\n");
++	for (;;) {
++		uint8_t rx[AR_WIRE] = {0};
++		struct ar_frame next;
++		int error = ar_transfer(rx);
++		if (error) {
++			ar_dispatch(&previous, &empty);
++			printf("ALITOUCH: stage C stopped transport=%d\n", error);
++			break;
++		}
++		if (!ar_decode(rx, &next)) {
++			if (failures < 5) {
++				++failures;
++			}
++			if (diagnostics < 8) {
++				printf("ALITOUCH: rejected report status=%#x count=%#x crc=%u\n",
++				    rx[3], rx[8], (unsigned)(as_crc(rx + 7, AR_DATA) ==
++				    ((uint16_t)rx[69] | ((uint16_t)rx[70] << 8))));
++				++diagnostics;
++			}
++			if (failures == 5) {
++				ar_dispatch(&previous, &empty);
++			}
++			ali_wait(failures == 5 ? 50 : 10);
++			continue;
++		}
++		failures = 0;
++		if (first || (first_contact && next.mask)) {
++			printf("ALITOUCH: valid report mask=%#x HID dispatch\n", next.mask);
++			first = false;
++			if (next.mask) {
++				first_contact = false;
++			}
++		}
++		ar_dispatch(&previous, &next);
++		ali_wait(10);
++	}
++	ali_wr(ali_se, AS_M_EN, 0);
++}
