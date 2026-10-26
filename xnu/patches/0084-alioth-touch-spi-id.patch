@@ -1,0 +1,513 @@
+From: alioth bring-up
+Subject: [PATCH] alioth: opt-in power/reset and bounded SPI chip identification
+
+Keep alitouch=1 as the existing stage-A probe. alitouch=2 additionally
+validates idle SPI firmware/FIFO geometry and an inherited XO clock,
+asserts GPIO33 reset, votes exact DT rails (ldoc1 1.8V then ldoc10 3.0V),
+configures qup4 pins/mode0/8-bit FIFO, and reads FT IDs A3/9F with CRC.
+The alioth RPMh entry point uses its DT reserved command DB, validates both
+resource names before requesting power, and retains TCS timeout quarantine.
+Sweet retains its original ldoc11 interface and DB locator.
+
+No IC register writes, firmware upgrade, DMA, interrupts or HID events.
+Transport faults stop further transfers; CRC/status retries are capped at3.
+Full kernel build and physical ID5652 confirmation are still required.
+
+diff --git a/bsd/dev/sweet_alitouch.h b/bsd/dev/sweet_alitouch.h
+--- a/bsd/dev/sweet_alitouch.h
++++ b/bsd/dev/sweet_alitouch.h
+@@ -1,11 +1,12 @@
+ /*
+- * ALIOTOUCH stage A (POCO F3 / alioth, SM8250): READ-ONLY diagnostics for the
++ * ALIOTOUCH stage A (POCO F3 / alioth, SM8250): diagnostics for the
+  * FocalTech FT3658U touch controller on GENI SE4 (SPI, 0x990000).
+  *
+- * Included from sweet_touch.c; started by boot-arg alitouch=1.
+- * Writes: ONLY ORs the three QUP0 clock-vote bits (S4, M_AHB, S_AHB) into
++ * Included from sweet_touch.c; alitouch=1 probes, alitouch=2 also runs stage B.
++ * Stage A ONLY ORs the three QUP0 clock-vote bits (S4, M_AHB, S_AHB) into
+  * GCC_QUPV3_WRAP_0_CLK_ENA (0x52008), exactly what Linux does. No TLMM
+- * writes, no RPMh votes, no SPI traffic, no GENI register writes.
++ * writes, no RPMh votes, no SPI traffic, no GENI register writes in stage A.
++ * Stage B's additional hardware writes are documented in sweet_alispi.h.
+  * Facts from live.dts / vendor gcc-kona.c / pinctrl-kona.c:
+  *   TLMM 0xf000000; NORTH tile +0x900000 (GPIO 8..11 = qup4 SPI),
+  *   SOUTH tile +0x500000 (GPIO 33 = reset, GPIO 39 = irq); pin n at +0x1000*n.
+@@ -69,13 +70,20 @@
+ 	    (status & 0xf0000000u) == 0x20000000u;
+ }
+ 
++#include "sweet_alispi.h"
++
+ static void
+ ali_thread(void *arg, wait_result_t result)
+ {
+ 	unsigned delay_s = 45;
++	int stage = 1;
+ 	(void)arg;
+ 	(void)result;
+ 	(void)PE_parse_boot_argn("alitouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("alitouch", &stage, sizeof(stage));
++	if (delay_s > 300) {
++		delay_s = 300;
++	}
+ 	printf("ALITOUCH: stage A (read-only), starting in %u s\n", delay_s);
+ 	ali_wait(delay_s * 1000u);
+ 
+@@ -140,6 +148,9 @@
+ 	    ali_rd(ali_se, 0x224), ali_rd(ali_se, 0x230), ali_rd(ali_se, 0x25c),
+ 	    ali_rd(ali_se, 0x268), ali_rd(ali_se, 0x258));
+ 	printf("ALITOUCH: stage A done\n");
++	if (stage == 2) {
++		ali_stage_b();
++	}
+ out:
+ 	(void)thread_terminate(current_thread());
+ 	thread_block(THREAD_CONTINUE_NULL);
+diff --git a/bsd/dev/sweet_alispi.h b/bsd/dev/sweet_alispi.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_alispi.h
+@@ -0,0 +1,309 @@
++/*
++ * Alioth stage B: bounded FT3658U identification, opt-in alitouch=2.
++ * Included after the stage-A MMIO/wait helpers. No IC register writes,
++ * firmware upload, DMA, GIC setup or HID dispatch. GPIO/RPMh/SE writes
++ * follow alioth live DT and downstream spi-geni-qcom/focaltech_spi sources.
++ */
++extern int alioth_rpmh_touch_power(void);
++
++#define AS_STATUS       0x040u
++#define AS_MCLK         0x048u
++#define AS_M_CMD        0x600u
++#define AS_M_CTRL       0x604u
++#define AS_M_IRQ        0x610u
++#define AS_M_EN         0x614u
++#define AS_M_CLEAR      0x618u
++#define AS_TX           0x700u
++#define AS_RX           0x780u
++#define AS_TX_STATUS    0x800u
++#define AS_RX_STATUS    0x804u
++#define AS_ACTIVE       ((1u << 0) | (1u << 12))
++#define AS_DONE         (1u << 0)
++#define AS_FIFO_ERRORS  ((3u << 24) | (3u << 28))
++#define AS_ERRORS       (0x3eu | AS_FIFO_ERRORS)
++#define AS_IRQ_MASK     (AS_DONE | AS_ERRORS | (3u << 26) | (1u << 30))
++#define AS_FIFO_WORDS   16u
++#define AS_TIMEOUT_US   25000u
++
++static bool as_poisoned;
++
++/* Exact downstream packing for 8-bit words, four words/FIFO, MSB-first. */
++static uint32_t
++as_packing(unsigned half)
++{
++	unsigned i = half * 2;
++	uint32_t a = (((i * 8 + 7) << 5) | (1u << 4) | (7u << 1));
++	uint32_t b = ((((i + 1) * 8 + 7) << 5) | (1u << 4) | (7u << 1));
++	if (half == 1) {
++		b |= 1; /* End of packing vector. */
++	}
++	return a | (b << 10);
++}
++
++static uint16_t
++as_crc(const uint8_t *data, unsigned count)
++{
++	uint16_t crc = 0xffff;
++	for (unsigned i = 0; i < count; ++i) {
++		crc ^= data[i];
++		for (unsigned j = 0; j < 8; ++j) {
++			crc = (crc >> 1) ^ ((crc & 1) ? 0x8408 : 0);
++		}
++	}
++	return crc;
++}
++
++static bool
++as_response_ok(const uint8_t rx[10])
++{
++	return !(rx[3] & 0xa0) && as_crc(rx + 7, 1) ==
++	    ((uint16_t)rx[8] | ((uint16_t)rx[9] << 8));
++}
++
++static bool
++as_clock_known(uint32_t cmd, uint32_t cfg, uint32_t sel)
++{
++	/* GCC parent0=19.2 MHz XO; no M/N mode, HID0 bypass or HID1 divide1.
++	 * Do not retune a shared RCG/PLL or guess an inherited source frequency.
++	 */
++	return !(cmd & 1u) && !(cfg & 0x3700u) && (cfg & 0x1fu) <= 1 && sel == 0;
++}
++
++static bool
++as_preflight(void)
++{
++	uint32_t status = ali_rd(ali_se, AS_STATUS);
++	uint32_t fw = ali_rd(ali_se, 0x68);
++	uint32_t tx = ali_rd(ali_se, 0xe24), rx = ali_rd(ali_se, 0xe28);
++	uint32_t cfg = ali_rd(ali_gcc, ALI_RCG + 4);
++	if (((fw >> 8) & 0xff) != 1 || (status & AS_ACTIVE) ||
++	    (ali_rd(ali_se, 0x64) & 1) || ali_rd(ali_se, 0x258) ||
++	    ali_rd(ali_se, 0xe18) ||
++	    ((tx >> 16) & 0x3f) != AS_FIFO_WORDS ||
++	    ((rx >> 16) & 0x3f) != AS_FIFO_WORDS ||
++	    ((tx >> 24) & 0x3f) != 32 || ((rx >> 24) & 0x3f) != 32 ||
++	    (ali_rd(ali_se, AS_TX_STATUS) & 0xfffffff) ||
++	    (ali_rd(ali_se, AS_RX_STATUS) & 0x1ffffff) ||
++	    !as_clock_known(ali_rd(ali_gcc, ALI_RCG), cfg, ali_rd(ali_se, 0x7c))) {
++		printf("ALITOUCH: stage B preflight refused status=%#x fw=%#x rcg=%#x tx=%#x rx=%#x\n",
++		    status, fw, cfg, tx, rx);
++		return false;
++	}
++	return true;
++}
++
++static bool
++as_reset(bool high)
++{
++	/* GPIO33 SOUTH offset0x1000: preserve existing drive and pull fields. */
++	uint32_t cfg = ali_rd(ali_ts, 0x1000);
++	uint32_t io = ali_rd(ali_ts, 0x1004);
++	ali_wr(ali_ts, 0x1004, (io & ~2u) | (high ? 2u : 0u));
++	ali_wr(ali_ts, 0x1000, (cfg & ~0x3cu) | 0x200u);
++	return (ali_rd(ali_ts, 0x1000) & 0x23cu) == 0x200u &&
++	    (ali_rd(ali_ts, 0x1004) & 2u) == (high ? 2u : 0u);
++}
++
++static bool
++as_pins(void)
++{
++	/* DT qup4 mux1. Last generic bias setting is pull-down for GPIO8-10.
++	 * GPIO11 CS has its own DT state: 16 mA, pull-up. Hardware owns output.
++	 */
++	for (unsigned i = 0; i < 4; ++i) {
++		uint32_t cfg = (1u << 2) | (i == 3 ? (7u << 6) | 3u : (2u << 6) | 1u);
++		uint32_t off = i * 0x1000u;
++		ali_wr(ali_tn, off, (ali_rd(ali_tn, off) & ~0x3ffu) | cfg);
++		if ((ali_rd(ali_tn, off) & 0x3ffu) != cfg) {
++			return false;
++		}
++	}
++	/* GPIO39 IRQ: GPIO input, 8 mA, pull-up. No interrupt configuration. */
++	ali_wr(ali_ts, 0x7000, (ali_rd(ali_ts, 0x7000) & ~0x3ffu) | (3u << 6) | 3u);
++	return (ali_rd(ali_ts, 0x7000) & 0x3ffu) == ((3u << 6) | 3u);
++}
++
++static bool
++as_setup(void)
++{
++	/* Poll status locally; keep the SE's CPU and GSI interrupt outputs masked. */
++	ali_wr(ali_se, 0xe1c, 0);
++	ali_wr(ali_se, 0xe18, 0);
++	ali_wr(ali_se, 0x644, 0);
++	ali_wr(ali_se, AS_M_EN, 0);
++	ali_wr(ali_se, 0x28, ali_rd(ali_se, 0x28) | 0x7fu);
++	ali_wr(ali_se, 0xe30, ali_rd(ali_se, 0xe30) | 0xfu);
++	ali_wr(ali_se, 0x24, 0x7f);
++	ali_wr(ali_se, 0x20, 1);
++	ali_wr(ali_se, 0x258, 0);
++	ali_wr(ali_se, 0x810, 0);
++	ali_wr(ali_se, 0x814, AS_FIFO_WORDS - 2);
++	ali_wr(ali_se, 0x80c, 1);
++	ali_wr(ali_se, 0x224, ali_rd(ali_se, 0x224) & ~1u); /* CPHA0 */
++	ali_wr(ali_se, 0x22c, ali_rd(ali_se, 0x22c) & ~3u); /* no loopback */
++	ali_wr(ali_se, 0x230, ali_rd(ali_se, 0x230) & ~4u); /* CPOL0 */
++	ali_wr(ali_se, 0x24c, 0); /* active-low CS */
++	ali_wr(ali_se, 0x250, 0); /* CS0 */
++	ali_wr(ali_se, 0x25c, ali_rd(ali_se, 0x25c) & ~1u); /* no CS toggle */
++	ali_wr(ali_se, 0x268, 4); /* word length = 8 - 4 */
++	ali_wr(ali_se, 0x274, 0);
++	ali_wr(ali_se, 0x278, 0);
++	ali_wr(ali_se, 0x254, 0);
++	ali_wr(ali_se, 0x260, as_packing(0));
++	ali_wr(ali_se, 0x264, as_packing(1));
++	ali_wr(ali_se, 0x284, as_packing(0));
++	ali_wr(ali_se, 0x288, as_packing(1));
++	/* XO19.2MHz / 20 = 960kHz, below the board's 6MHz maximum. */
++	ali_wr(ali_se, 0x7c, 0);
++	ali_wr(ali_se, AS_MCLK, (20u << 4) | 1u);
++	ali_wr(ali_se, AS_M_CLEAR, 0xffffffffu);
++	ali_wr(ali_se, 0x648, 0xffffffffu);
++	ali_wr(ali_se, AS_M_EN, AS_IRQ_MASK);
++	bool ok = ali_rd(ali_se, 0x268) == 4 &&
++	    ali_rd(ali_se, 0x260) == as_packing(0) &&
++	    ali_rd(ali_se, 0x264) == as_packing(1) &&
++	    ali_rd(ali_se, 0x284) == as_packing(0) &&
++	    ali_rd(ali_se, 0x288) == as_packing(1) &&
++	    ali_rd(ali_se, AS_MCLK) == ((20u << 4) | 1u) &&
++	    ali_rd(ali_se, AS_M_EN) == AS_IRQ_MASK &&
++	    !ali_rd(ali_se, 0xe1c) && !ali_rd(ali_se, 0x258) &&
++	    !(ali_rd(ali_se, AS_STATUS) & AS_ACTIVE);
++	printf("ALITOUCH: SPI mode0 8-bit 960kHz FIFO setup=%u pack=%#x/%#x\n",
++	    (unsigned)ok, as_packing(0), as_packing(1));
++	return ok;
++}
++
++/* Never retry a transport fault. Cancel our active command once, with a bound. */
++static void
++as_stop(void)
++{
++	as_poisoned = true;
++	if (ali_rd(ali_se, AS_STATUS) & 1u) {
++		ali_wr(ali_se, AS_M_CTRL, 1u << 2);
++		for (unsigned us = 0; us < 10000; ++us) {
++			if (!(ali_rd(ali_se, AS_STATUS) & 1u)) {
++				break;
++			}
++			delay(1);
++		}
++	}
++	printf("ALITOUCH: SPI stopped status=%#x irq=%#x; no further transfers\n",
++	    ali_rd(ali_se, AS_STATUS), ali_rd(ali_se, AS_M_IRQ));
++}
++
++static int
++as_transfer_id(uint8_t reg, uint8_t rx[10])
++{
++	const uint8_t tx[10] = {reg, 0xa0, 0, 1, 0, 0, 0, 0, 0, 0};
++	if (as_poisoned || (ali_rd(ali_se, AS_STATUS) & AS_ACTIVE) ||
++	    (ali_rd(ali_se, AS_TX_STATUS) & 0xfffffff) ||
++	    (ali_rd(ali_se, AS_RX_STATUS) & 0x1ffffff)) {
++		return EBUSY;
++	}
++	ali_wr(ali_se, AS_M_CLEAR, 0xffffffffu);
++	ali_wr(ali_se, 0x26c, sizeof(tx));
++	ali_wr(ali_se, 0x270, sizeof(tx));
++	ali_wr(ali_se, AS_M_CMD, 3u << 27); /* full duplex, one CS transaction */
++	/* Ten bytes fit in three of the sixteen FIFO words; never need DMA. */
++	for (unsigned i = 0; i < sizeof(tx); i += 4) {
++		uint32_t word = 0;
++		for (unsigned j = 0; j < 4 && i + j < sizeof(tx); ++j) {
++			word |= (uint32_t)tx[i + j] << (j * 8);
++		}
++		ali_wr(ali_se, AS_TX, word);
++	}
++	unsigned received = 0;
++	uint32_t irq = 0;
++	for (unsigned us = 0; us < AS_TIMEOUT_US; ++us) {
++		irq = ali_rd(ali_se, AS_M_IRQ);
++		if (irq & AS_ERRORS) {
++			break;
++		}
++		uint32_t rs = ali_rd(ali_se, AS_RX_STATUS);
++		unsigned wc = rs & 0x1ffffffu;
++		unsigned last = (rs >> 28) & 7u;
++		/* LAST may remain set after draining the FIFO; WC0 has no data. */
++		if (wc > AS_FIFO_WORDS || (wc && (rs & (1u << 31)) && last > 4)) {
++			break;
++		}
++		for (unsigned w = 0; w < wc; ++w) {
++			unsigned n = ((rs & (1u << 31)) && w + 1 == wc && last) ? last : 4;
++			if (n > sizeof(tx) - received) {
++				goto fault;
++			}
++			uint32_t word = ali_rd(ali_se, AS_RX);
++			for (unsigned j = 0; j < n; ++j) {
++				rx[received++] = (uint8_t)(word >> (8 * j));
++			}
++		}
++		if (irq & AS_DONE) {
++			if (received != sizeof(tx) || (ali_rd(ali_se, AS_STATUS) & AS_ACTIVE) ||
++			    (ali_rd(ali_se, AS_TX_STATUS) & 0xfffffff)) {
++				break;
++			}
++			ali_wr(ali_se, AS_M_CLEAR, irq);
++			delay(150); /* focaltech CS_HIGH_DELAY */
++			return 0;
++		}
++		delay(1);
++	}
++fault:
++	printf("ALITOUCH: SPI reg=%#x fault irq=%#x received=%u/10\n", reg, irq, received);
++	as_stop();
++	return EIO;
++}
++
++static int
++as_read_id(uint8_t reg, uint8_t *value)
++{
++	for (unsigned attempt = 0; attempt < 3; ++attempt) {
++		uint8_t rx[10] = {0};
++		int error = as_transfer_id(reg, rx);
++		if (error) {
++			return error;
++		}
++		printf("ALITOUCH: reg=%#x try=%u status=%#x data=%#x crc=%02x%02x valid=%u\n",
++		    reg, attempt + 1, rx[3], rx[7], rx[9], rx[8], (unsigned)as_response_ok(rx));
++		if (as_response_ok(rx)) {
++			*value = rx[7];
++			return 0;
++		}
++	}
++	return EIO;
++}
++
++static void
++ali_stage_b(void)
++{
++	printf("ALITOUCH: stage B begin (power/reset/SPI ID only)\n");
++	if (!as_preflight()) {
++		return;
++	}
++	if (!as_reset(false)) {
++		printf("ALITOUCH: reset-low readback failed; power skipped\n");
++		return;
++	}
++	ali_wait(2);
++	int error = alioth_rpmh_touch_power();
++	if (error) {
++		printf("ALITOUCH: stage B power failed=%d; reset held low, SPI skipped\n", error);
++		return;
++	}
++	ali_wait(10);
++	if (!as_setup() || !as_pins() || !as_reset(true)) {
++		printf("ALITOUCH: stage B setup/pin/reset readback failed\n");
++		ali_wr(ali_se, AS_M_EN, 0);
++		(void)as_reset(false);
++		return;
++	}
++	ali_wait(300); /* exceeds vendor reset-to-ready delay */
++	uint8_t hi = 0, lo = 0;
++	error = as_read_id(0xa3, &hi);
++	if (!error) {
++		error = as_read_id(0x9f, &lo);
++	}
++	ali_wr(ali_se, AS_M_EN, 0);
++	printf("ALITOUCH: stage B ID=%02x%02x expected=5652 error=%d match=%u\n",
++	    hi, lo, error, (unsigned)(!error && hi == 0x56 && lo == 0x52));
++	/* A successful ID proves the bus only. No touch events are injected here. */
++}
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -12,6 +12,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int alioth_rpmh_touch_power(void);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -51,6 +52,7 @@
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+ static bool rh_poisoned;
++static bool rh_board_set, rh_alioth;
+ 
+ static uint32_t
+ rh_read(vm_offset_t base, uint32_t off)
+@@ -98,18 +100,24 @@
+ }
+ 
+ static int
+-rh_map(void)
+-{
++rh_map(bool alioth)
++{
++	/* Never reuse a DB mapping selected for a different board. Caller holds lock. */
++	if (rh_board_set && rh_alioth != alioth) {
++		return EINVAL;
++	}
++	rh_board_set = true;
++	rh_alioth = alioth;
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
+ 	}
+ 	if (!rh_tcs) {
+ 		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict) {
++	if (!alioth && !rh_dict) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
++	if (!rh_rsc || !rh_tcs || (!alioth && !rh_dict)) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -129,9 +137,11 @@
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		/* Alioth's live DT provides a reserved-memory region directly. */
++		uint32_t pa = alioth ? 0x80860000u : rh_read(rh_dict, 0);
++		uint32_t size = alioth ? 0x20000u : rh_read(rh_dict, 4);
++		printf("SWEET RPMH: cmd-db board=%s pa=%#x size=%#x\n",
++		    alioth ? "alioth" : "sweet", pa, size);
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+@@ -234,7 +244,7 @@
+ 		for (unsigned c = 0; c < rh_ncpt; ++c) {
+ 			if ((enabled & (1u << c)) &&
+ 			    (rh_read(rh_tcs, b + RH_ADDR + c * RH_CMD_STRIDE) & ~15u) == address) {
+-				printf("SWEET RPMH: conflicting inherited L11C request in TCS%u\n", t);
++				printf("SWEET RPMH: conflicting inherited resource %#x in TCS%u\n", address, t);
+ 				return EBUSY;
+ 			}
+ 		}
+@@ -320,7 +330,7 @@
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: resource %#x ACTIVE vote complete (not voltage measurement)\n", address);
+ 	return 0;
+ }
+ 
+@@ -341,7 +351,7 @@
+ 		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
+ 		goto out;
+ 	}
+-	error = rh_map();
++	error = rh_map(false);
+ 	if (!error) {
+ 		error = rh_lookup(res, &address);
+ 	}
+@@ -355,4 +365,42 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/* Exact alioth DT resources/voltages only; no arbitrary regulator interface. */
++int
++alioth_rpmh_touch_power(void)
++{
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	uint32_t vcc = 0, vdd = 0;
++	int error = EIO;
++	if (rh_poisoned) {
++		goto out;
++	}
++	error = rh_map(true);
++	if (!error) {
++		error = rh_lookup("ldoc1", &vcc);
++	}
++	if (!error) {
++		error = rh_lookup("ldoc10", &vdd);
++	}
++	/* Validate both names before any request. Follow Linux: VCC before VDD. */
++	if (!error && vcc == vdd) {
++		error = EINVAL;
++	}
++	if (!error) {
++		printf("ALITOUCH: RPMh VCC ldoc1=1800 mV, then VDD ldoc10=3000 mV\n");
++		error = rh_send(vcc, 1800);
++	}
++	if (!error) {
++		delay(1000);
++		error = rh_send(vdd, 3000);
++	}
++out:
++	/* Leave reset asserted on error; never undo an uncertain/shared rail vote. */
++	printf("ALITOUCH: touch power result=%d\n", error);
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
