@@ -1,0 +1,270 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,8 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/alioth_smmu_tables.c		standard
++bsd/dev/alioth_gpu_memtest.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void ali_gpu_memtest_start(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -660,6 +661,7 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	ali_gpu_memtest_start();
+ 	return 0;
+ }
+ 
+--- /dev/null
++++ b/bsd/dev/alioth_smmu_tables.h
+@@ -0,0 +1,15 @@
++/* Offline preparation core. Caller owns/pins a contiguous 16K-aligned arena.
++ * Never modify tables after attaching them to hardware. No MMIO here.
++ * Address widths (39/40) are provisional, not device capability readings. */
++#ifndef ALIOTH_SMMU_TABLES_H
++#define ALIOTH_SMMU_TABLES_H
++#include <stdint.h>
++#include <stddef.h>
++#define ALI_PT_BYTES 65536u
++#define ALI_PT_MAX_PAGES 256u
++struct ali_page { uint64_t iova, pa; unsigned executable; };
++/* Returns 0, or -1 invalid request / -2 table capacity. Failure leaves arena
++ * and used untouched. Input and arena must not overlap. Single caller only. */
++int ali_pt_build(void *arena, uint64_t arena_pa, const struct ali_page *pages,
++    size_t count, unsigned *used);
++#endif
+--- /dev/null
++++ b/bsd/dev/alioth_smmu_tables.c
+@@ -0,0 +1,53 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "alioth_smmu_tables.h"
++
++int ali_pt_build(void *arena, uint64_t base, const struct ali_page *pages,
++    size_t count, unsigned *used)
++{
++    uint64_t keys[15];
++    unsigned levels[15], n = 0;
++    if (!arena || !pages || !used || !count || count > ALI_PT_MAX_PAGES ||
++        ((uintptr_t)arena & 16383) || (base & 16383) ||
++        base > (1ULL << 40) - ALI_PT_BYTES) return -1;
++    /* Validate every input and reserve table topology before changing memory. */
++    for (size_t i = 0; i < count; ++i) {
++        uint64_t va = pages[i].iova, pa = pages[i].pa;
++        if ((va & 4095) || (pa & 4095) || va >= (1ULL << 39) ||
++            pa >= (1ULL << 40) || pages[i].executable > 1 ||
++            (pa < base + ALI_PT_BYTES && pa + 4096 > base)) return -1;
++        for (size_t j = 0; j < i; ++j)
++            if (pages[j].iova == va || pages[j].pa == pa) return -1;
++        for (unsigned level = 2; level <= 3; ++level) {
++            uint64_t key = va >> (level == 2 ? 30 : 21);
++            unsigned k;
++            for (k = 0; k < n; ++k)
++                if (levels[k] == level && keys[k] == key) break;
++            if (k == n) {
++                if (n == 15) return -2;
++                keys[n] = key; levels[n++] = level;
++            }
++        }
++    }
++    uint64_t *out = arena;
++    for (size_t i = 0; i < ALI_PT_BYTES / sizeof(*out); ++i) out[i] = 0;
++    for (size_t i = 0; i < count; ++i) {
++        uint64_t va = pages[i].iova;
++        unsigned parent = 0;
++        for (unsigned level = 2; level <= 3; ++level) {
++            unsigned shift = level == 2 ? 30 : 21, k;
++            for (k = 0; k < n; ++k)
++                if (levels[k] == level && keys[k] == (va >> shift)) break;
++            unsigned child = k + 1;
++            out[parent * 512 + ((va >> shift) & 511)] = (base + child * 4096) | 3;
++            parent = child;
++        }
++        /* Normal NC (MAIR0=0x44), privileged RW, AF/nG/outer-shareable. */
++        uint64_t attrs = 0xe03;
++        if (!pages[i].executable) attrs |= 3ULL << 53;
++        out[parent * 512 + ((va >> 12) & 511)] = pages[i].pa | attrs;
++    }
++    *used = n + 1;
++    return 0;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/alioth_gpu_memtest.c
+@@ -0,0 +1,164 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Experimental XNU allocation adapter. Not wired into kernel startup.
++ * Prepares EMPTY GMU backing and detached tables only; never starts DMA.
++ * Caller serializes access, passes a zeroed context, and releases it only
++ * while detached. Do not use release once hardware can access the memory.
++ */
++#ifdef ALI_HOST_TEST
++#include "xnu_test_api.h"
++#else
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <mach/kern_return.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++/* Present in this XNU's arm/pmap/pmap.c but absent from vm/pmap.h.
++ * Same private declaration used by the built-in SWEET UFS driver. */
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++#endif
++#include "alioth_smmu_tables.h"
++
++#define ALI_DATA_BYTES 163840u /* 148KiB rounded up to XNU 16KiB pages */
++struct ali_prepared {
++    vm_offset_t tables, data;
++    uint64_t tables_pa, data_pa;
++    unsigned table_count;
++};
++
++static void ali_release_detached(struct ali_prepared *p)
++{
++    if (p->data) kmem_free(kernel_map, p->data, ALI_DATA_BYTES);
++    if (p->tables) kmem_free(kernel_map, p->tables, ALI_PT_BYTES);
++    *p = (struct ali_prepared){0};
++}
++
++static int ali_allocate(vm_offset_t *va, uint64_t *pa, unsigned size)
++{
++    if (kmem_alloc_contig(kernel_map, va, size, PAGE_MASK, 0, 0,
++        KMA_DATA | KMA_ZERO | KMA_NOPAGEWAIT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) return -1;
++    ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)*va);
++    if (!pn) return -1;
++    *pa = ptoa_64(pn);
++    if ((*pa & 16383) || *pa > (1ULL << 40) - size) return -1;
++    /* Verify every XNU page; do not merely assume the first PA covers all. */
++    for (unsigned off = 0; off < size; off += 16384) {
++        pn = pmap_find_phys(kernel_pmap, (addr64_t)(*va + off));
++        if (!pn || ptoa_64(pn) != *pa + off) return -1;
++    }
++    return 0;
++}
++
++int ali_prepare_detached(struct ali_prepared *p)
++{
++    if (!p || p->tables || p->data || p->tables_pa || p->data_pa ||
++        p->table_count || PAGE_SIZE != 16384) return -1;
++    if (ali_allocate(&p->tables, &p->tables_pa, ALI_PT_BYTES) ||
++        ali_allocate(&p->data, &p->data_pa, ALI_DATA_BYTES)) goto fail;
++    struct ali_page pages[37];
++    const uint64_t starts[] = {0x4000, 0x144000, 0x157000, 0x60000000};
++    const unsigned counts[] = {8, 19, 9, 1};
++    unsigned n = 0;
++    /* Layout is specific to the inspected firmware, not a generic loader. */
++    for (unsigned r = 0; r < 4; ++r)
++        for (unsigned j = 0; j < counts[r]; ++j) {
++            pages[n] = (struct ali_page){starts[r] + j * 4096,
++                p->data_pa + n * 4096, r != 3}; ++n;
++        }
++    if (ali_pt_build((void *)p->tables, p->tables_pa, pages, n,
++        &p->table_count)) goto fail;
++    flush_dcache64((addr64_t)p->data_pa, ALI_DATA_BYTES, TRUE);
++    flush_dcache64((addr64_t)p->tables_pa, ALI_PT_BYTES, TRUE);
++    /* No TTBR/stream writes. Cache sync must be repeated after firmware copy. */
++    return 0;
++fail:
++    ali_release_detached(p);
++    return -1;
++}
++
++/* Independent software walk of detached tables. Never a hardware translation. */
++static int ali_walk_detached(const struct ali_prepared *p, uint64_t va,
++    uint64_t *pa, uint64_t *leaf)
++{
++    uint64_t table = p->tables_pa;
++    if (va >= (1ULL << 39)) return -1;
++    for (int shift = 30; shift >= 12; shift -= 9) {
++        if (table < p->tables_pa || table - p->tables_pa >= ALI_PT_BYTES ||
++            (table & 4095)) return -1;
++        const uint64_t *entries = (const void *)(p->tables + table - p->tables_pa);
++        uint64_t entry = entries[(va >> shift) & 511];
++        if (!entry) return 1;
++        if ((entry & 3) != 3) return -1;
++        table = entry & 0xfffffff000ULL;
++        if (shift == 12) {
++            *pa = table | (va & 4095); *leaf = entry; return 0;
++        }
++    }
++    return -1;
++}
++
++static int ali_verify_detached(const struct ali_prepared *p)
++{
++    const uint64_t starts[] = {0x4000, 0x144000, 0x157000, 0x60000000};
++    const unsigned counts[] = {8, 19, 9, 1};
++    unsigned n = 0;
++    uint64_t pa = 0, leaf = 0;
++    if (p->table_count != 5) return -1;
++    for (unsigned r = 0; r < 4; ++r)
++        for (unsigned j = 0; j < counts[r]; ++j, ++n)
++            for (unsigned edge = 0; edge <= 4095; edge += 4095) {
++                uint64_t expected = p->data_pa + n * 4096;
++                uint64_t attributes = 0xe03 | (r == 3 ? 3ULL << 53 : 0);
++                if (ali_walk_detached(p, starts[r] + j * 4096 + edge, &pa, &leaf) ||
++                    pa != expected + edge || leaf != (expected | attributes)) return -1;
++            }
++    const uint64_t holes[] = {0, 0x10004000, 0xc000, 0x143000, 0x160000,
++        0x60001000};
++    for (unsigned i = 0; i < sizeof(holes) / sizeof(holes[0]); ++i)
++        if (ali_walk_detached(p, holes[i], &pa, &leaf) != 1) return -1;
++    return 0;
++}
++
++#ifndef ALI_HOST_TEST
++#include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++/* Same private Mach declaration as the built-in SWEET touch provider. */
++extern kern_return_t thread_terminate(thread_t);
++
++void ali_gpu_memtest_start(void);
++static void ali_gpu_memtest_thread(void *arg, wait_result_t result)
++{
++    (void)arg; (void)result;
++    static int sleep_channel;
++    uint64_t deadline;
++    clock_interval_to_deadline(60, NSEC_PER_SEC, &deadline);
++    (void)assert_wait_deadline(&sleep_channel, THREAD_UNINT, deadline);
++    thread_block(THREAD_CONTINUE_NULL);
++    struct ali_prepared p = {0};
++    int rc = ali_prepare_detached(&p);
++    if (rc == 0) rc = ali_verify_detached(&p);
++    ali_release_detached(&p);
++    printf("ALIGPU MEMTEST: result=%d expected_pages=37 detached=1 released=1\n", rc);
++    (void)thread_terminate(current_thread());
++    thread_block(THREAD_CONTINUE_NULL);
++}
++
++void ali_gpu_memtest_start(void)
++{
++    /* Called once from the serialized UFS provider initialization path. */
++    static int started;
++    int enabled = 0;
++    thread_t thread;
++    if (started || !PE_parse_boot_argn("aligpumem", &enabled, sizeof(enabled)) ||
++        enabled != 1) return;
++    started = 1;
++    kern_return_t kr = kernel_thread_start(ali_gpu_memtest_thread, NULL, &thread);
++    if (kr == KERN_SUCCESS) thread_deallocate(thread);
++    else printf("ALIGPU MEMTEST: thread error=%d\n", kr);
++}
++#endif
++
++#endif
