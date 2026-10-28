@@ -1,0 +1,247 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -485,4 +485,60 @@
+     return error;
+ }
+ 
++/* Opt-in RSC READ transactions. These program a command slot but never
++ * request a resource voltage change. Not a passive register snapshot. */
++#include "alioth_arc_transport.h"
++static uint32_t ali_arc_io_read(void *arg, uint32_t off)
++{ (void)arg; return rh_read(rh_tcs, off); }
++static void ali_arc_io_write(void *arg, uint32_t off, uint32_t value)
++{ (void)arg; rh_write(rh_tcs, off, value); }
++static void ali_arc_io_delay(void *arg, unsigned us)
++{ (void)arg; delay(us); }
++
++int alioth_gpu_arc_readback(void);
++int alioth_gpu_arc_readback(void)
++{
++    if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++    int error = EIO;
++    static const char *names[] = {"mx.lvl", "cx.lvl", "gfx.lvl"};
++    struct ali_arc_resource resources[3] = {0};
++    uint32_t values[3] = {0};
++    if (!rh_poisoned) error = rh_map(true);
++    for (unsigned i = 0; !error && i < 3; ++i)
++        error = ali_arc_lookup(names[i], &resources[i]);
++    if (!error && (resources[0].address == resources[1].address ||
++        resources[0].address == resources[2].address ||
++        resources[1].address == resources[2].address)) error = EINVAL;
++    if (!error) {
++        struct ali_arc_transport t = {
++            {NULL, ali_arc_io_read, ali_arc_io_write, ali_arc_io_delay},
++            rh_ncpt, 0
++        };
++        for (unsigned i = 0; !error && i < 3; ++i) {
++            int rc = ali_arc_read(&t, resources[i].address, &values[i]);
++            if (rc) {
++                printf("ALIGPU ARCREAD: resource=%s transport=%d quarantined=%u\n",
++                    names[i], rc, t.poisoned);
++                error = rc == -2 ? EBUSY : rc == -4 ? ETIMEDOUT : EIO;
++            } else if (values[i] >= resources[i].decoded.count) {
++                printf("ALIGPU ARCREAD: resource=%s invalid_raw=%#x count=%u\n",
++                    names[i], values[i], resources[i].decoded.count);
++                error = EINVAL;
++            }
++        }
++        if (t.poisoned) rh_poisoned = true;
++    }
++    if (!error) {
++        for (unsigned i = 0; i < 3; ++i) {
++            unsigned index = values[i];
++            uint8_t *aux = resources[i].aux;
++            unsigned level = aux[2*index] | ((unsigned)aux[2*index+1] << 8);
++            printf("ALIGPU ARCREAD: resource=%s drv=2 index=%u level=%u votes=0\n",
++                names[i], index, level);
++        }
++    }
++    __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++    return error;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/alioth_gpu_memtest.c
++++ b/bsd/dev/alioth_gpu_memtest.c
+@@ -158,6 +158,7 @@
+ }
+ 
+ extern int alioth_gpu_arc_probe(void);
++extern int alioth_gpu_arc_readback(void);
+ void ali_gpu_memtest_start(void);
+ static void ali_gpu_memtest_thread(void *arg, wait_result_t result)
+ {
+@@ -179,6 +180,12 @@
+         int arc_rc = alioth_gpu_arc_probe();
+         printf("ALIGPU ARC: result=%d readonly=1 votes=0\n", arc_rc);
+     }
++    int vote_enabled = 0;
++    if (rc == 0 && PE_parse_boot_argn("aligpuvote", &vote_enabled, sizeof(vote_enabled)) &&
++        vote_enabled == 1) {
++        int vote_rc = alioth_gpu_arc_readback();
++        printf("ALIGPU ARCREAD: result=%d votes=0\n", vote_rc);
++    }
+     (void)thread_terminate(current_thread());
+     thread_block(THREAD_CONTINUE_NULL);
+ }
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -113,6 +113,7 @@
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/alioth_smmu_tables.c		standard
+ bsd/dev/alioth_arc_levels.c		standard
++bsd/dev/alioth_arc_transport.c		standard
+ bsd/dev/alioth_gpu_memtest.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- /dev/null
++++ b/bsd/dev/alioth_arc_transport.c
+@@ -0,0 +1,115 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "alioth_arc_transport.h"
++#define STRIDE 0x2a0u
++#define CMD_STRIDE 0x14u
++#define IRQ_EN 0u
++#define IRQ_STATUS 4u
++#define IRQ_CLEAR 8u
++#define WAIT 0x10u
++#define CONTROL 0x14u
++#define STATUS 0x18u
++#define ENABLE 0x1cu
++#define MSGID 0x30u
++#define ADDRESS 0x34u
++#define DATA 0x38u
++#define CMD_STATUS 0x3cu
++#define RESPONSE 0x40u
++#define AMC (1u << 16)
++#define TRIGGER (1u << 24)
++#define DONE ((1u << 8) | (1u << 16))
++static uint32_t rd(struct ali_arc_transport *t, uint32_t off)
++{ return t->io.read(t->io.context, off); }
++static void wr(struct ali_arc_transport *t, uint32_t off, uint32_t v)
++{ t->io.write(t->io.context, off, v); }
++static int sync_reg(struct ali_arc_transport *t, uint32_t off, uint32_t v)
++{
++    wr(t, off, v);
++    for (unsigned i=0;i<1000;i++) {
++        if (rd(t, off)==v) return 1;
++        t->io.delay_us(t->io.context,1);
++    }
++    return 0;
++}
++static int free_slot(struct ali_arc_transport *t, unsigned slot)
++{
++    uint32_t b=slot*STRIDE, idle=rd(t,b+STATUS), irq=rd(t,IRQ_STATUS);
++    return idle && idle!=UINT32_MAX && irq!=UINT32_MAX &&
++        rd(t,b+CONTROL)==0 && rd(t,b+ENABLE)==0 && rd(t,b+WAIT)==0 &&
++        !(irq & (1u<<slot));
++}
++static int transfer(struct ali_arc_transport *t, uint32_t address, unsigned index,
++    uint32_t *response)
++{
++    if (!t || !t->io.read || !t->io.write || !t->io.delay_us ||
++        t->commands_per_tcs<1 || t->commands_per_tcs>16 ||
++        (address>>16)!=3 || (address&3) || index>15) return -1;
++    if (t->poisoned) return -3;
++    int slot=-1;
++    uint32_t mask=(1u<<t->commands_per_tcs)-1;
++    /* Check inherited commands in SLEEP/WAKE as well as ACTIVE. Never edit
++     * sleep/wake banks, never borrow a nonempty or not-idle slot. This does
++     * NOT recover an already completed bootloader vote; caller owns that. */
++    for (unsigned s=0;s<8;s++) {
++        uint32_t b=s*STRIDE, enabled=rd(t,b+ENABLE);
++        if (enabled & ~mask) return -3;
++        for (unsigned c=0;c<t->commands_per_tcs;c++)
++            if ((enabled & (1u<<c)) && rd(t,b+ADDRESS+c*CMD_STRIDE)==address)
++                return -2;
++        if (s<2 && slot<0 && free_slot(t,s)) slot=(int)s;
++    }
++    if (slot<0) return -2;
++    uint32_t b=(unsigned)slot*STRIDE, bit=1u<<(unsigned)slot;
++    uint32_t saved_irq=rd(t,IRQ_EN);
++    if (saved_irq==UINT32_MAX || !free_slot(t,(unsigned)slot)) return -2;
++    t->poisoned=1;
++    if (!sync_reg(t,IRQ_EN,saved_irq & ~bit)) return -3;
++    if (!free_slot(t,(unsigned)slot)) {
++        uint32_t now=rd(t,IRQ_EN);
++        if (now==UINT32_MAX || !sync_reg(t,IRQ_EN,(now & ~bit)|(saved_irq & bit))) return -3;
++        t->poisoned=0;
++        return -2;
++    }
++    /* Pre-v3 RSC uses8-byte requests for reads too. READ clears WRITE bit16;
++     * response-required stays set. No ARC vote is sent by a READ command. */
++    uint32_t msgid=8u|(1u<<8)|(response ? 0 : (1u<<16));
++    if (!sync_reg(t,b+MSGID,msgid) ||
++        !sync_reg(t,b+ADDRESS,address) || !sync_reg(t,b+DATA,index) ||
++        !sync_reg(t,b+WAIT,1) || !sync_reg(t,b+ENABLE,1) ||
++        !sync_reg(t,b+CONTROL,0) || !sync_reg(t,b+CONTROL,AMC)) return -3;
++    wr(t,b+CONTROL,AMC|TRIGGER);
++    int done=0,progress=0;
++    for (unsigned us=0;us<100000;us++) {
++        uint32_t irq=rd(t,IRQ_STATUS), idle=rd(t,b+STATUS), cs=rd(t,b+CMD_STATUS);
++        /* Invalid reads cannot be used as proof of execution progress. */
++        if (irq==UINT32_MAX || idle==UINT32_MAX || cs==UINT32_MAX) return -3;
++        int complete=(cs & DONE)==DONE;
++        progress |= !idle || !complete;
++        if (idle && complete && ((irq & bit)||progress)) {done=1;break;}
++        t->io.delay_us(t->io.context,1);
++    }
++    if (!done) return -4; /* Never clear/reuse an uncertain transaction. */
++    uint32_t value=0;
++    if (response) {
++        value=rd(t,b+RESPONSE);
++        /* All-ones is invalid for ARC and may indicate inaccessible MMIO. */
++        if (value==UINT32_MAX) return -3;
++    }
++    if (!sync_reg(t,b+CONTROL,AMC) || !sync_reg(t,b+CONTROL,0) ||
++        !sync_reg(t,b+ENABLE,0) || !sync_reg(t,b+WAIT,0)) return -3;
++    wr(t,IRQ_CLEAR,bit);
++    uint32_t irq=rd(t,IRQ_STATUS), now=rd(t,IRQ_EN);
++    if (irq==UINT32_MAX || (irq & bit) || now==UINT32_MAX ||
++        !sync_reg(t,IRQ_EN,(now & ~bit)|(saved_irq & bit))) return -3;
++    t->poisoned=0;
++    if (response) *response=value;
++    return 0;
++}
++int ali_arc_send(struct ali_arc_transport *t, uint32_t address, unsigned index)
++{ return transfer(t,address,index,0); }
++int ali_arc_read(struct ali_arc_transport *t, uint32_t address, uint32_t *value)
++{
++    if (!value) return -1;
++    return transfer(t,address,0,value);
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/alioth_arc_transport.h
+@@ -0,0 +1,30 @@
++#ifndef ALI_ARC_TRANSPORT_H
++#define ALI_ARC_TRANSPORT_H
++#include <stdint.h>
++struct ali_arc_io {
++    void *context;
++    uint32_t (*read)(void *, uint32_t);
++    void (*write)(void *, uint32_t, uint32_t);
++    void (*delay_us)(void *, unsigned);
++};
++struct ali_arc_transport {
++    struct ali_arc_io io;
++    unsigned commands_per_tcs;
++    unsigned poisoned;
++};
++/* Pre-v3 alioth apps DRV2 only: 2 ACTIVE + 3 SLEEP + 3 WAKE TCS.
++ * Caller holds exclusive RSC ownership/lock and has validated geometry.
++ * IO callbacks must provide device-memory ordering/barriers and bounded
++ * operations; this core cannot recover a bus abort or a blocking callback.
++ * This is transport ONLY. Caller must establish inherited shared vote floor,
++ * MX/CX dependency and validate index against live ARC aux data first.
++ * No default MMIO adapter or startup hook is supplied.
++ * Returns0 success,-1 invalid,-2 busy,-3 uncertain I/O,-4 timeout.
++ */
++int ali_arc_send(struct ali_arc_transport *, uint32_t address, unsigned index);
++/* Read this DRV's vote, not the aggregate across DRVs. This submits an RSC
++ * READ transaction (controller register writes), not a passive MMIO dump.
++ * Output is unchanged unless transaction AND cleanup succeed. Returned raw
++ * value must be checked against the live resource table before using it. */
++int ali_arc_read(struct ali_arc_transport *, uint32_t address, uint32_t *value);
++#endif
