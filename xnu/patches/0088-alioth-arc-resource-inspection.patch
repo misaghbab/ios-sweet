@@ -1,0 +1,178 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -403,4 +403,86 @@
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++/* Read-only command DB inspection. Caller holds rh_lock; no RPMh writes. */
++#include "alioth_arc_levels.h"
++struct ali_arc_resource {
++    uint32_t address;
++    uint16_t version;
++    uint8_t aux[32];
++    unsigned bytes;
++    struct ali_arc_level decoded;
++};
++
++static int
++ali_arc_lookup(const char *name, struct ali_arc_resource *out)
++{
++    uint32_t key[2] = {0, 0};
++    for (unsigned i = 0; i < 8 && name[i]; ++i)
++        key[i / 4] |= (uint32_t)(uint8_t)name[i] << (8u * (i % 4));
++    unsigned matches = 0;
++    struct ali_arc_resource found = {0};
++    for (unsigned i = 0; i < 8; ++i) {
++        uint32_t h = 8 + 16 * i;
++        unsigned slave = rh_db16(h);
++        if (!slave) break;
++        uint32_t entries = RH_DB_HEADER + rh_db16(h + 2);
++        uint32_t aux = RH_DB_HEADER + rh_db16(h + 4);
++        unsigned count = rh_db16(h + 6);
++        if (slave < 3 || slave > 5 || (entries & 3) || count > 1024 ||
++            !rh_range(entries, count * RH_DB_ENTRY) || !rh_range(aux, 0))
++            return EINVAL;
++        for (unsigned j = 0; j < count; ++j) {
++            uint32_t e = entries + j * RH_DB_ENTRY;
++            if (rh_read(rh_db, e) != key[0] || rh_read(rh_db, e + 4) != key[1])
++                continue;
++            uint32_t addr = rh_read(rh_db, e + 16);
++            unsigned len = rh_db16(e + 20);
++            uint32_t start = aux + rh_db16(e + 22);
++            if (++matches != 1 || slave != 3 || (addr >> 16) != 3 ||
++                (addr & 3) || len < 2 || len > 32 || (len & 1) ||
++                (start & 1) || !rh_range(start, len)) return EINVAL;
++            for (unsigned k = 0; k < len; k += 2) {
++                uint16_t v = rh_db16(start + k);
++                found.aux[k] = (uint8_t)v;
++                found.aux[k + 1] = (uint8_t)(v >> 8);
++            }
++            if (ali_arc_select(found.aux, len, 0, &found.decoded)) return EINVAL;
++            found.address = addr;
++            found.version = rh_db16(h + 8);
++            found.bytes = len;
++        }
++    }
++    if (matches != 1) return ENODEV;
++    *out = found;
++    return 0;
++}
++
++int alioth_gpu_arc_probe(void);
++int
++alioth_gpu_arc_probe(void)
++{
++    if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
++    int error = EIO;
++    static const char *names[] = {"mx.lvl", "cx.lvl", "gfx.lvl"};
++    struct ali_arc_resource resources[3] = {0};
++    if (!rh_poisoned) error = rh_map(true);
++    for (unsigned i = 0; !error && i < 3; ++i)
++        error = ali_arc_lookup(names[i], &resources[i]);
++    if (!error && (resources[0].address == resources[1].address ||
++        resources[0].address == resources[2].address ||
++        resources[1].address == resources[2].address)) error = EINVAL;
++    if (!error) {
++        for (unsigned i = 0; i < 3; ++i) {
++            struct ali_arc_resource *r = &resources[i];
++            printf("ALIGPU ARC: resource=%s address=%#x version=%#x count=%u readonly=1\n",
++                names[i], r->address, r->version, r->decoded.count);
++            for (unsigned j = 0; j < r->decoded.count; ++j)
++                printf("ALIGPU ARC: resource=%s index=%u level=%u\n", names[i], j,
++                    (unsigned)(r->aux[2*j] | ((unsigned)r->aux[2*j+1] << 8)));
++        }
++    }
++    __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++    return error;
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/alioth_gpu_memtest.c
++++ b/bsd/dev/alioth_gpu_memtest.c
+@@ -157,6 +157,7 @@
+         cx, gx, ahb, gmu);
+ }
+ 
++extern int alioth_gpu_arc_probe(void);
+ void ali_gpu_memtest_start(void);
+ static void ali_gpu_memtest_thread(void *arg, wait_result_t result)
+ {
+@@ -172,6 +173,12 @@
+     ali_release_detached(&p);
+     printf("ALIGPU MEMTEST: result=%d expected_pages=37 detached=1 released=1\n", rc);
+     if (rc == 0) ali_gpu_cc_snapshot();
++    int arc_enabled = 0;
++    if (rc == 0 && PE_parse_boot_argn("aligpuarc", &arc_enabled, sizeof(arc_enabled)) &&
++        arc_enabled == 1) {
++        int arc_rc = alioth_gpu_arc_probe();
++        printf("ALIGPU ARC: result=%d readonly=1 votes=0\n", arc_rc);
++    }
+     (void)thread_terminate(current_thread());
+     thread_block(THREAD_CONTINUE_NULL);
+ }
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/alioth_smmu_tables.c		standard
++bsd/dev/alioth_arc_levels.c		standard
+ bsd/dev/alioth_gpu_memtest.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- /dev/null
++++ b/bsd/dev/alioth_arc_levels.c
+@@ -0,0 +1,36 @@
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include "alioth_arc_levels.h"
++
++/* Downstream rpmh-regulator.c:1263: 1..16 little-endian u16 values;
++ * zero after the first entry terminates the map. Be stricter about padding
++ * and ordering so corrupted data cannot become a power command index. */
++int ali_arc_select(const uint8_t *aux, size_t bytes, uint16_t minimum,
++    struct ali_arc_level *out)
++{
++    if (!aux || !out || bytes < 2 || bytes > 32 || (bytes & 1)) return -1;
++    uint16_t previous = 0;
++    unsigned count = 0, padded = 0, found = 0;
++    struct ali_arc_level selected = {0};
++    for (unsigned i = 0; i < bytes / 2; ++i) {
++        uint16_t level = (uint16_t)(aux[2*i] | ((uint16_t)aux[2*i+1] << 8));
++        if (i && !level) padded = 1;
++        if (padded) {
++            if (level) return -1;
++            continue;
++        }
++        if (i && level < previous) return -1;
++        previous = level;
++        ++count;
++        if (!found && level >= minimum) {
++            selected.level = level;
++            selected.index = (uint8_t)i;
++            found = 1;
++        }
++    }
++    if (!found) return -2;
++    selected.count = (uint8_t)count;
++    *out = selected;
++    return 0;
++}
++
++#endif
+--- /dev/null
++++ b/bsd/dev/alioth_arc_levels.h
+@@ -0,0 +1,14 @@
++#ifndef ALI_ARC_LEVELS_H
++#define ALI_ARC_LEVELS_H
++#include <stddef.h>
++#include <stdint.h>
++struct ali_arc_level {
++    uint16_t level;
++    uint8_t index, count;
++};
++/* Decode cmd-db ARC auxiliary data; never accepts a millivolt VRM request.
++ * Caller must first validate resource name, ARC slave/address and DB bounds.
++ * Failure leaves output unchanged. No hardware access or voting occurs. */
++int ali_arc_select(const uint8_t *aux, size_t bytes, uint16_t minimum,
++    struct ali_arc_level *out);
++#endif
