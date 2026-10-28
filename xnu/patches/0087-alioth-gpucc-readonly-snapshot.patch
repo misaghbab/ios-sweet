@@ -1,0 +1,46 @@
+--- a/bsd/dev/alioth_gpu_memtest.c
++++ b/bsd/dev/alioth_gpu_memtest.c
+@@ -128,6 +128,35 @@
+ /* Same private Mach declaration as the built-in SWEET touch provider. */
+ extern kern_return_t thread_terminate(thread_t);
+ 
++/* Opt-in GPUCC observation only. Never touches powered GPU/GMU/SMMU.
++ * Alioth live DT: gpucc@3d90000; GDSCR CX=+106c, GX=+100c.
++ * gpucc-kona.c: AHB CBCR=+1078, CX GMU CBCR=+1098.
++ * Read-only does not guarantee bus accessibility under every bootloader.
++ * Do not infer usable GPU/SMMU clocks from these four values alone.
++ * One 16KiB controller mapping is retained until reboot, as with other
++ * built-in SWEET MMIO mappings. No DMA allocation is retained.
++ */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++static void ali_gpu_cc_snapshot(void)
++{
++    int enabled = 0;
++    if (!PE_parse_boot_argn("aligpucc", &enabled, sizeof(enabled)) ||
++        enabled != 1) return;
++    vm_offset_t base = ml_io_map(0x03d90000, 0x4000);
++    if (!base) {
++        printf("ALIGPU GPUCC: map failed\n");
++        return;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint32_t cx = *(volatile const uint32_t *)(base + 0x106c);
++    uint32_t gx = *(volatile const uint32_t *)(base + 0x100c);
++    uint32_t ahb = *(volatile const uint32_t *)(base + 0x1078);
++    uint32_t gmu = *(volatile const uint32_t *)(base + 0x1098);
++    __asm__ volatile("dsb sy" ::: "memory");
++    printf("ALIGPU GPUCC: cx=%#x gx=%#x ahb=%#x gmu=%#x readonly=1\n",
++        cx, gx, ahb, gmu);
++}
++
+ void ali_gpu_memtest_start(void);
+ static void ali_gpu_memtest_thread(void *arg, wait_result_t result)
+ {
+@@ -142,6 +171,7 @@
+     if (rc == 0) rc = ali_verify_detached(&p);
+     ali_release_detached(&p);
+     printf("ALIGPU MEMTEST: result=%d expected_pages=37 detached=1 released=1\n", rc);
++    if (rc == 0) ali_gpu_cc_snapshot();
+     (void)thread_terminate(current_thread());
+     thread_block(THREAD_CONTINUE_NULL);
+ }
