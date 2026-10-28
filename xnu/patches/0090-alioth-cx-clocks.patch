@@ -1,0 +1,247 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -495,8 +495,43 @@
+ static void ali_arc_io_delay(void *arg, unsigned us)
+ { (void)arg; delay(us); }
+ 
+-int alioth_gpu_arc_readback(void);
+-int alioth_gpu_arc_readback(void)
++/* Only controller MMIO. Deliberately excludes GMU, GX, SMMU and firmware. */
++#include "alioth_cx_clocks.h"
++struct ali_cx_maps { vm_offset_t bank[2]; };
++static uint32_t __attribute__((noinline))
++ali_cx_mmio_read(void *arg, unsigned bank, uint32_t off)
++{
++    struct ali_cx_maps *m=arg;
++    vm_offset_t address=m->bank[bank]+off;
++    uint32_t v;
++    __asm__ volatile("ldr %w0, [%1]" : "=r"(v) : "r"(address) : "memory");
++    __asm__ volatile("dmb oshld" ::: "memory");
++    return v;
++}
++static void __attribute__((noinline))
++ali_cx_mmio_write(void *arg, unsigned bank, uint32_t off, uint32_t v)
++{
++    struct ali_cx_maps *m=arg;
++    vm_offset_t address=m->bank[bank]+off;
++    __asm__ volatile("dmb oshst" ::: "memory");
++    __asm__ volatile("str %w0, [%1]" : : "r"(v), "r"(address) : "memory");
++    __asm__ volatile("dsb osh" ::: "memory");
++}
++static void ali_cx_mmio_delay(void *arg, unsigned us) { (void)arg; delay(us); }
++static int ali_cx_run(unsigned mx, unsigned cx)
++{
++    /* The one-shot worker owns these mappings until reboot. */
++    struct ali_cx_maps m={{ml_io_map(0x00100000,0x74000),ml_io_map(0x03d90000,0x9000)}};
++    if(!m.bank[0] || !m.bank[1]) return ENOMEM;
++    struct ali_cx_io io={&m,ali_cx_mmio_read,ali_cx_mmio_write,ali_cx_mmio_delay};
++    struct ali_cx_result result;
++    int rc=ali_cx_clocks(&io,mx,cx,&result);
++    printf("ALIGPU CX: result=%d stage=%u writes=%u retained=%u off=%#x value=%#x votes=0\n",
++        rc,result.stage,result.writes,result.retained,result.offset,result.value);
++    return rc ? EIO : 0;
++}
++
++static int ali_gpu_readback_and_cx(int enable_cx)
+ {
+     if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) return EBUSY;
+     int error = EIO;
+@@ -537,8 +572,19 @@
+                 names[i], index, level);
+         }
+     }
++    if (!error && enable_cx) {
++        unsigned mx=resources[0].aux[2*values[0]] | (resources[0].aux[2*values[0]+1]<<8);
++        unsigned cx=resources[1].aux[2*values[1]] | (resources[1].aux[2*values[1]+1]<<8);
++        /* Conservative test prerequisite based on observed inherited floor.
++         * Refuse lower levels, never raise/lower a shared rail here. */
++        error=(mx<256 || cx<256) ? EINVAL : ali_cx_run(mx,cx);
++    }
+     __atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+     return error;
+ }
++int alioth_gpu_arc_readback(void);
++int alioth_gpu_arc_readback(void) { return ali_gpu_readback_and_cx(0); }
++int alioth_gpu_cx_start(void);
++int alioth_gpu_cx_start(void) { return ali_gpu_readback_and_cx(1); }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/alioth_gpu_memtest.c
++++ b/bsd/dev/alioth_gpu_memtest.c
+@@ -159,6 +159,7 @@
+ 
+ extern int alioth_gpu_arc_probe(void);
+ extern int alioth_gpu_arc_readback(void);
++extern int alioth_gpu_cx_start(void);
+ void ali_gpu_memtest_start(void);
+ static void ali_gpu_memtest_thread(void *arg, wait_result_t result)
+ {
+@@ -186,6 +187,11 @@
+         int vote_rc = alioth_gpu_arc_readback();
+         printf("ALIGPU ARCREAD: result=%d votes=0\n", vote_rc);
+     }
++    int cx_enabled = 0;
++    if (rc == 0 && PE_parse_boot_argn("aligpucx", &cx_enabled, sizeof(cx_enabled)) && cx_enabled == 1) {
++        int cx_rc = alioth_gpu_cx_start();
++        printf("ALIGPU CXTEST: result=%d firmware=0 gx=0\n", cx_rc);
++    }
+     (void)thread_terminate(current_thread());
+     thread_block(THREAD_CONTINUE_NULL);
+ }
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/alioth_smmu_tables.c		standard
+ bsd/dev/alioth_arc_levels.c		standard
+ bsd/dev/alioth_arc_transport.c		standard
++bsd/dev/alioth_cx_clocks.c		standard
+ bsd/dev/alioth_gpu_memtest.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- /dev/null
++++ b/bsd/dev/alioth_cx_clocks.h
+@@ -0,0 +1,22 @@
++#ifndef ALI_CX_CLOCKS_H
++#define ALI_CX_CLOCKS_H
++#include <stdint.h>
++struct ali_cx_io {
++    void *context;
++    uint32_t (*read)(void *, unsigned, uint32_t);
++    void (*write)(void *, unsigned, uint32_t, uint32_t);
++    void (*delay_us)(void *, unsigned);
++};
++struct ali_cx_result {
++    unsigned stage, writes, retained;
++    uint32_t offset, value;
++};
++/* Bank0=GCC, bank1=GPUCC. Caller serializes access and supplies ordered IO.
++ * Fresh DRV2 MX/CX level codes must be >=256. No ARC vote writes, GX,
++ * firmware, SMMU, or GMU register access. No rollback after uncertainty:
++ * enabled resources remain until reboot. Success means requested controller
++ * states were observed, not GPU execution or all gated clocks running.
++ * Returns0 success,-1 argument/floor,-2 inherited busy,-3 invalid/readback,
++ * -4 bounded timeout. A bus abort is outside this callback contract. */
++int ali_cx_clocks(const struct ali_cx_io *, unsigned, unsigned, struct ali_cx_result *);
++#endif
+--- /dev/null
++++ b/bsd/dev/alioth_cx_clocks.c
+@@ -0,0 +1,119 @@
++/*
++MIT License
++
++Copyright (c) 2026 Leo Malik
++Copyright (c) 2026 dipa-studio
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
++*/
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* Register sequence adapted from ios-apollo 0096/0097/0099,
++ * commit4c75a006b27b195818849e0a635b5c26ba44bf56.
++ * Copyright (c) 2026 Leo Malik; Copyright (c) 2026 dipa-studio.
++ * MIT; see LICENSE.apollo. Added fail-closed validation and retained-state
++ * semantics: never collapse an inherited domain or lower shared ARC votes. */
++#include "alioth_cx_clocks.h"
++#define ON (1u << 31)
++static int readv(const struct ali_cx_io *io, unsigned bank, uint32_t off,
++                 struct ali_cx_result *r, uint32_t *v)
++{
++    r->offset = off; r->value = *v = io->read(io->context, bank, off);
++    return *v == UINT32_MAX ? -3 : 0;
++}
++static int poll(const struct ali_cx_io *io, unsigned bank, uint32_t off,
++                uint32_t mask, uint32_t want, unsigned attempts, struct ali_cx_result *r)
++{
++    for (unsigned i=0; i<attempts; ++i) {
++        uint32_t v;
++        if (readv(io,bank,off,r,&v)) return -3;
++        if ((v & mask)==want) return 0;
++        io->delay_us(io->context,10);
++    }
++    return -4;
++}
++static int update(const struct ali_cx_io *io, unsigned bank, uint32_t off,
++                  uint32_t mask, uint32_t bits, struct ali_cx_result *r)
++{
++    uint32_t old;
++    if (readv(io,bank,off,r,&old)) return -3;
++    uint32_t next=(old & ~mask)|bits;
++    if (next==old) return 0;
++    ++r->writes; r->retained=1;
++    io->write(io->context,bank,off,next);
++    return poll(io,bank,off,mask,bits,100,r);
++}
++int ali_cx_clocks(const struct ali_cx_io *io, unsigned mx, unsigned cx,
++                  struct ali_cx_result *r)
++{
++    if (!r) return -1;
++    *r=(struct ali_cx_result){0};
++    if (!io || !io->read || !io->write || !io->delay_us || mx<256 || cx<256) return -1;
++    uint32_t v, gdsc, hw, rcg, gmu;
++    int e;
++    r->stage=1;
++    /* Establish configuration-bus access before touching GPUCC. */
++    if (readv(io,0,0x71004,r,&v)) return -3;
++    if ((v & ON) && !(v & 2)) return -2;
++    /* Refuse changing the source of an inherited running GMU or RCG update. */
++    if (readv(io,1,0x106c,r,&gdsc) || readv(io,1,0x1540,r,&hw) ||
++        readv(io,1,0x1120,r,&rcg) || readv(io,1,0x1098,r,&gmu)) return -3;
++    if ((gdsc & 2) || (rcg & 1) || !(gmu & ON) || (gmu & 1)) return -2;
++    /* Check every register we intend to modify before the first write. */
++    const uint32_t gcc[]={0x52000,0x7100c,0x71018,0x71154};
++    const uint32_t cc[]={0x1124,0x109c,0x1078,0x1088,0x108c,0x5000};
++    for(unsigned i=0;i<4;++i) if(readv(io,0,gcc[i],r,&v)) return -3;
++    for(unsigned i=0;i<6;++i) if(readv(io,1,cc[i],r,&v)) return -3;
++    r->stage=2;
++    if ((gdsc & 1) && ((gdsc|hw)&ON)) return -2;
++    if (!(gdsc & 1) && !((gdsc|hw)&ON)) return -2;
++    if (gdsc & 1) {
++        if((e=update(io,1,0x106c,1,0,r))) return e;
++        /* Either GDSCR or its hardware status may report power-on. */
++        unsigned i;
++        for(i=0;i<5000;++i) {
++            if(readv(io,1,0x106c,r,&gdsc)||readv(io,1,0x1540,r,&hw)) return -3;
++            if((gdsc|hw)&ON) break;
++            io->delay_us(io->context,10);
++        }
++        if(i==5000) return -4;
++    }
++    r->stage=3;
++    if((e=update(io,0,0x52000,3u<<15,3u<<15,r))) return e;
++    for(unsigned i=1;i<4;++i) if((e=update(io,0,gcc[i],1,1,r))) return e;
++    r->stage=4;
++    if((e=update(io,1,0x1124,0x371f,0x602,r))) return e;
++    /* UPDATE self-clears; do not demand a readback of the asserted bit. */
++    if(readv(io,1,0x1120,r,&v)) return -3;
++    ++r->writes; r->retained=1;
++    io->write(io->context,1,0x1120,v|1);
++    if((e=poll(io,1,0x1120,1,0,100,r))) return e;
++    if((e=poll(io,1,0x1124,0x371f,0x602,100,r))) return e;
++    r->stage=5;
++    for(unsigned i=1;i<6;++i) {
++        if((e=update(io,1,cc[i],1,1,r))) return e;
++        /* Voted/HW-gated branches are checked for enable only. */
++        if(cc[i]==0x109c && (e=poll(io,1,cc[i],ON,0,100,r))) return e;
++    }
++    if((e=update(io,1,0x1098,1,1,r))) return e;
++    if((e=poll(io,1,0x1098,ON,0,100,r))) return e;
++    r->stage=6;
++    return 0;
++}
++
++#endif
