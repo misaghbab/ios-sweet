@@ -423,6 +423,18 @@ eagl_leave(struct eagl *e, unsigned offset)
 	if (check_errors && offset != 0x338 && (error = glGetError()) != 0) {
 		if (e->errors++ < 60) {
 			say("sweet-gl: %s: error %#x\n", eagl_slot_name(offset), error);
+            if (error == 0x506) {
+                static unsigned fbo_reports;
+                if (fbo_reports++ < 8) {
+                    GLint fb=0,kind=0,name=0;
+                    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&fb);
+                    GLenum status=glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+                    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,0x8cd0,&kind);
+                    glGetFramebufferAttachmentParameteriv(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,0x8cd1,&name);
+                    say("sweet-gl: incomplete framebuffer %d status %#x color-type %#x color-name %d frame %u\n",
+                        fb,status,kind,name,e->frames);
+                }
+            }
 		}
 	}
 	if (slow_calls_us != 0) {
@@ -659,7 +671,7 @@ surface_mirrored(struct eagl *e, struct image *image)
 	IOSurfaceRef surface = image->surface;
 	GLint bound = 0;
 
-	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first || image->deep ||
+	if (!blit_targets || !share_surfaces || !image->target || image->alpha_first ||
 	    image->format != GL_BGRA || image->type != GL_UNSIGNED_BYTE || image->plane != 0 ||
 	    (size_t)image->width != IOSurfaceGetWidth(surface) || (size_t)image->height != IOSurfaceGetHeight(surface)) {
 		return false;
@@ -667,7 +679,12 @@ surface_mirrored(struct eagl *e, struct image *image)
 	glGetIntegerv(GL_TEXTURE_BINDING_2D, &bound);
 	glGenTextures(1, &image->mirror);
 	glBindTexture(GL_TEXTURE_2D, image->mirror);
-	if (!sweet_gl_surface_texture(e->gl, IOSurfaceGetID(surface))) {
+	uint32_t surface_id = IOSurfaceGetID(surface);
+    if (image->deep && (surface_id & 0xc0000000u)) {
+        glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
+        glDeleteTextures(1, &image->mirror); image->mirror=0; return false;
+    }
+    if (!sweet_gl_surface_texture(e->gl, surface_id | (image->deep ? 0x40000000u : 0))) {
 		glBindTexture(GL_TEXTURE_2D, (GLuint)bound);
 		glDeleteTextures(1, &image->mirror);
 		image->mirror = 0;

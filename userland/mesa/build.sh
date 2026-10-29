@@ -6,7 +6,7 @@
 #
 #   userland/mesa/build.sh OUT
 #
-# OUT/lib/libOSMesa.8.dylib     install name /usr/local/lib/libOSMesa.8.dylib, ad hoc signed
+# OUT/lib/libOSMesa.8.dylib     install name /usr/local/lib/alioth-0096/libOSMesa.8.dylib, ad hoc signed
 #                               (programs declare what they use of it: userland/gl-test)
 # MESA_WORK/meta/gl.xml, exported-gl.txt
 #                               the Khronos registry Mesa has and the gl* functions the library
@@ -84,7 +84,7 @@ ninja -C build src/gallium/targets/osmesa/libOSMesa.8.dylib
 mkdir -p "$out/lib"
 lib=$out/lib/libOSMesa.8.dylib
 xcrun strip -x -o "$lib" build/src/gallium/targets/osmesa/libOSMesa.8.dylib
-xcrun install_name_tool -id /usr/local/lib/libOSMesa.8.dylib "$lib"
+xcrun install_name_tool -id /usr/local/lib/alioth-0096/libOSMesa.8.dylib "$lib"
 codesign -s - -f "$lib"
 mkdir -p "$work/meta"
 cp mesa-$VERSION/src/mapi/glapi/registry/gl.xml "$work/meta/gl.xml"

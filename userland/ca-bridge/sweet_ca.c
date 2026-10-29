@@ -1,7 +1,7 @@
 /*
  * libsweet-ca.dylib: what the kernel puts into backboardd (boot-arg
- * sweetinject=/usr/local/lib/libsweet-ca.dylib:backboardd, xnu 0114) so that CoreAnimation draws
- * with the GPU: it loads /usr/local/lib/libsweet-gl.dylib (eagl.c), the OpenGL ES behind
+ * sweetinject=/usr/local/lib/alioth-0096/libsweet-ca.dylib:backboardd, xnu 0114) so that CoreAnimation draws
+ * with the GPU: it loads /usr/local/lib/alioth-0096/libsweet-gl.dylib (eagl.c), the OpenGL ES behind
  * EAGLContext, before the window server makes its first context.
  *
  * The kernel offers the GPU (the SweetGPU service) some seconds after the window server has
@@ -35,7 +35,7 @@ extern io_service_t IOServiceGetMatchingService(mach_port_t mainPort, CFDictiona
 extern kern_return_t IOObjectRelease(io_object_t object);
 extern const char *getprogname(void);
 
-#define SWEET_GL        "/usr/local/lib/libsweet-gl.dylib"
+#define SWEET_GL        "/usr/local/lib/alioth-0096/libsweet-gl.dylib"
 
 static void
 say(const char *format, ...)

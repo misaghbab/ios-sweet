@@ -1,0 +1,108 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -47,6 +47,7 @@
+ #include <sys/proc.h>
+ 
+ #include "SweetSurface.h"
++#include "AliothDisplayPlane.h"
+ 
+ extern "C" {
+ /* bsd/dev/sweet_gpu.c, "the GPU kept on": called with gGPULock held */
+@@ -82,6 +83,7 @@
+ 	kMsmSubmitQueueNew      = 0x4a,
+ 	kMsmSubmitQueueClose    = 0x4b,
+ 	kMsmSubmitQueueQuery    = 0x4c,
++	kSweetGpuDisplayPlane   = 0x7d,
+ 	kSweetGpuSurface        = 0x7e,         /* not Linux's (HackiOS's): an IOSurface's memory as a buffer */
+ };
+ 
+@@ -291,7 +293,7 @@
+ 	struct gpu_buffer *newBuffer(IOMemoryDescriptor *memory, uint64_t size, uint32_t flags, uint32_t *handle);
+ 	void freeBuffer(struct gpu_buffer *b);
+ 	IOReturn gemNew(struct msm_gem_new *request);
+-	IOReturn surfaceBuffer(struct sweet_surface_request *request);
++	IOReturn surfaceBuffer(struct sweet_surface_request *request, bool displayPlane);
+ 	IOReturn gemInfo(struct msm_gem_info *request);
+ 	IOReturn submit(struct msm_gem_submit *request);
+ 
+@@ -470,7 +472,7 @@
+  * lock it gives buffers back under). Asked only to describe it (SURFACE_DESCRIBE), no buffer is made.
+  */
+ IOReturn
+-SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *request)
++SweetGPUUserClient::surfaceBuffer(struct sweet_surface_request *request, bool displayPlane)
+ {
+ 	SweetSurface *s = sweet_surface_copy(request->surface);
+ 	struct gpu_buffer *b = NULL;
+@@ -485,6 +487,14 @@
+ 		s->release();
+ 		return kIOReturnNoMemory;
+ 	}
++    if (displayPlane) {
++        const struct sweet_surface_plane *p=&s->planes[0];
++        if (!alioth_display_plane_valid(s->pixelFormat,s->planeCount,s->readOnly,
++            s->width,s->height,p->width,p->height,p->bytesPerRow,p->offset,p->size,
++            s->planes[1].offset,p->bytesPerElement,p->elementWidth,p->elementHeight,size)) {
++            s->release(); return kIOReturnUnsupported;
++        }
++    }
+ 	request->size = size;
+ 	request->offset = s->offset;
+ 	request->rowBytes = s->bytesPerRow;
+@@ -492,6 +502,11 @@
+ 	request->height = s->height;
+ 	request->pixelFormat = s->pixelFormat;
+ 	request->planes = s->planeCount;
++    if (displayPlane) {
++        request->offset=s->planes[0].offset; request->rowBytes=s->planes[0].bytesPerRow;
++        request->pixelFormat=0x42475241u; request->planes=0;
++    }
++
+ 	if (request->handle == SURFACE_DESCRIBE) {
+ 		request->handle = 0;
+ 		s->release();
+@@ -793,8 +808,11 @@
+ 			(void)copyout(&zero, (user_addr_t)r.query.data, sizeof(zero));
+ 		}
+ 		break;
++	case kSweetGpuDisplayPlane:
++		ret = size == sizeof(r.surface) ? surfaceBuffer(&r.surface, true) : kIOReturnBadArgument;
++		break;
+ 	case kSweetGpuSurface:
+-		ret = surfaceBuffer(&r.surface);
++		ret = surfaceBuffer(&r.surface, false);
+ 		break;
+ 	case kDrmGemClose:
+ 		IOLockLock(gGPULock);
+--- /dev/null
++++ b/iokit/Kernel/arm/AliothDisplayPlane.h
+@@ -0,0 +1,14 @@
++/* Alioth display bridge: validate the existing BGRA-in-plane0 convention. */
++#ifndef ALIOTH_DISPLAY_PLANE_H
++#define ALIOTH_DISPLAY_PLANE_H
++#include <stdint.h>
++static inline int alioth_display_plane_valid(uint32_t format,uint32_t planes,int readonly,
++    uint32_t w,uint32_t h,uint32_t pw,uint32_t ph,uint32_t row,uint32_t offset,
++    uint32_t plane_size,uint32_t next_offset,uint32_t bpe,uint32_t ew,uint32_t eh,uint64_t allocation)
++{
++    uint64_t bytes=(uint64_t)row*h, end=(uint64_t)offset+bytes;
++    return format==0x62336138u && planes==2 && !readonly && w && h && w==pw && h==ph &&
++        bpe==4 && ew==1 && eh==1 && (uint64_t)w*4<=row && !(row&63) && !(offset&63) &&
++        bytes<=plane_size && end<=allocation && end<=next_offset;
++}
++#endif
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -47,9 +47,9 @@
+  */
+ bool alioth_files_ready = false;
+ static const char *const allowed_files[] = {
+-    "/usr/local/lib/libOSMesa.8.dylib",
+-    "/usr/local/lib/libsweet-gl.dylib",
+-    "/usr/local/lib/libsweet-ca.dylib"
++    "/usr/local/lib/alioth-0096/libOSMesa.8.dylib",
++    "/usr/local/lib/alioth-0096/libsweet-gl.dylib",
++    "/usr/local/lib/alioth-0096/libsweet-ca.dylib"
+ };
+ static bool sweet_file_allowed(const char *path)
+ {

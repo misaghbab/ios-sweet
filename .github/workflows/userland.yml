@@ -53,10 +53,10 @@ jobs:
           mkdir -p build-ca
           python3 userland/ca-bridge/mkeagl.py userland/ca-bridge/eagl_slots.txt mesa-work/meta/gl.xml \
             mesa-work/meta/exported-gl.txt userland/ca-bridge/eagl.c > build-ca/eagl_gen.h
-          $CC -O1 -Wall -dynamiclib -install_name /usr/local/lib/libsweet-gl.dylib -Ibuild-ca -Iuserland/ca-bridge \
+          $CC -O1 -Wall -dynamiclib -install_name /usr/local/lib/alioth-0096/libsweet-gl.dylib -Ibuild-ca -Iuserland/ca-bridge \
             -framework CoreFoundation -framework IOKit -framework IOSurface -lobjc out/lib/libOSMesa.8.dylib \
             -o out/lib/libsweet-gl.dylib userland/ca-bridge/eagl.c userland/ca-bridge/sweet_gl_osmesa.c
-          $CC -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/libsweet-ca.dylib \
+          $CC -O2 -Wall -Wextra -Werror -dynamiclib -install_name /usr/local/lib/alioth-0096/libsweet-ca.dylib \
             -framework IOKit -o out/lib/libsweet-ca.dylib userland/ca-bridge/sweet_ca.c
           codesign -s - -f out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib
           otool -L out/lib/libsweet-gl.dylib out/lib/libsweet-ca.dylib

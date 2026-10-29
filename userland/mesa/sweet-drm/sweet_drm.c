@@ -45,6 +45,8 @@ extern kern_return_t IOConnectUnmapMemory64(io_connect_t connect, uint32_t memor
 #define kIOReturnNotFound       ((kern_return_t)0xe00002f0)
 
 #define SWEET_GPU_SERVICE       "SweetGPU"
+#define SWEET_GPU_DISPLAY_PLANE 0x7d
+#define SWEET_DISPLAY_TAG       0x40000000u
 #define SWEET_GPU_SURFACE       0x7e            /* the request that is not Linux's (not in SweetGPU yet) */
 #define SWEET_GPU_DESCRIBE      0xffffffffu     /* ... asked only what the buffer would be like */
 
@@ -205,7 +207,9 @@ sweet_drm_surface(int fd, struct sweet_drm_surface *surface)
 
 	(void)fd;
 	surface->handle = SWEET_GPU_DESCRIBE;
-	error = call(SWEET_GPU_SURFACE, surface, sizeof(*surface));
+	uint32_t selector = surface->surface & SWEET_DISPLAY_TAG ? SWEET_GPU_DISPLAY_PLANE : SWEET_GPU_SURFACE;
+	surface->surface &= ~SWEET_DISPLAY_TAG;
+	error = call(selector, surface, sizeof(*surface));
 	if (error != 0) {
 		errno = error;
 		return -1;
@@ -217,7 +221,9 @@ int
 drmPrimeFDToHandle(int fd, int surface, uint32_t *handle)
 {
 	struct sweet_drm_surface request = { .surface = (uint32_t)surface };
-	int error = call(SWEET_GPU_SURFACE, &request, sizeof(request));
+	uint32_t selector = request.surface & SWEET_DISPLAY_TAG ? SWEET_GPU_DISPLAY_PLANE : SWEET_GPU_SURFACE;
+	request.surface &= ~SWEET_DISPLAY_TAG;
+	int error = call(selector, &request, sizeof(request));
 
 	(void)fd;
 	if (error != 0) {
