@@ -1,0 +1,234 @@
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1098,6 +1098,12 @@
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* files the boot image carries (/sweet-files), onto the root before launchd (bsd/dev/sweet_files.c) */
++	extern void sweet_files_install(void);
++	sweet_files_install();
++#endif
++
+ 	load_init_program(p);
+ 	lock_trace = 1;
+ }
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9900,6 +9900,23 @@
+ 	           UIO_USERSPACE);
+ }
+ 
++/*
++ * A directory made by the kernel itself, PATH in kernel memory (bsd/dev/sweet_files.c: the
++ * folders of the files the boot image carries, before launchd starts). Mode as given, owner
++ * root; EEXIST if it is there already.
++ */
++int sweet_kernel_mkdir(const char *path, mode_t mode);
++
++int
++sweet_kernel_mkdir(const char *path, mode_t mode)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode & ACCESSPERMS);
++	return mkdir1at(vfs_context_kernel(), CAST_USER_ADDR_T(path), &va, AT_FDCWD, UIO_SYSSPACE);
++}
++
+ static int
+ rmdirat_internal(vfs_context_t ctx, int fd, user_addr_t dirpath,
+     enum uio_seg segflg, int unlink_flags)
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -654,3 +654,4 @@
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
+ bsd/dev/sweet_gpu.c		standard
++bsd/dev/sweet_files.c		standard
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5580,6 +5580,9 @@
+ static bool
+ sweet_exec_inject(struct image_params *imgp, char *env, size_t size)
+ {
++    extern bool alioth_files_ready;
++    unsigned install=0;
++    if (PE_parse_boot_argn("sweetfiles", &install, sizeof(install)) && install==1 && !alioth_files_ready) return false;
+ 	char conf[200];
+ 	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY), *name = path, *word;
+ 	size_t namelen, liblen = 0;
+--- /dev/null
++++ b/bsd/dev/sweet_files.c
+@@ -0,0 +1,171 @@
++/* Adapted from aTechGeekDev/ios-apollo, pinned 4c75a006b27b195818849e0a635b5c26ba44bf56.
++MIT License
++
++Copyright (c) 2026 Leo Malik
++Copyright (c) 2026 dipa-studio
++
++Permission is hereby granted, free of charge, to any person obtaining a copy
++of this software and associated documentation files (the "Software"), to deal
++in the Software without restriction, including without limitation the rights
++to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++copies of the Software, and to permit persons to whom the Software is
++furnished to do so, subject to the following conditions:
++
++The above copyright notice and this permission notice shall be included in all
++copies or substantial portions of the Software.
++
++THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++SOFTWARE.
++
++Only three graphics libraries; sweetfiles=1 required. Creates missing files;
++existing files must match byte-for-byte. Installs before launchd, persists on root.
++*/
++#include <pexpert/arm64/board_config.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/vnode.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++void sweet_files_install(void);
++int sweet_kernel_mkdir(const char *path, mode_t mode);
++
++/* Alioth: only the three pinned graphics libraries, with explicit opt-in.
++ * Existing content is compared, never truncated. Partial/foreign content fails closed.
++ */
++bool alioth_files_ready = false;
++static const char *const allowed_files[] = {
++    "/usr/local/lib/libOSMesa.8.dylib",
++    "/usr/local/lib/libsweet-gl.dylib",
++    "/usr/local/lib/libsweet-ca.dylib"
++};
++static bool sweet_file_allowed(const char *path)
++{
++    for (unsigned i=0;i<3;i++) if (!strcmp(path,allowed_files[i])) return true;
++    return false;
++}
++
++static int sweet_file_verify(const char *path,const uint8_t *data,size_t size)
++{
++    vfs_context_t ctx=vfs_context_kernel(); vnode_t vp=NULLVP;
++    int error=vnode_open(path,FREAD|O_NOFOLLOW,0,0,&vp,ctx);
++    if (error) return error;
++    struct vnode_attr va; VATTR_INIT(&va); VATTR_WANTED(&va,va_data_size);
++    error=vnode_getattr(vp,&va,ctx);
++    if (!error && (vnode_vtype(vp)!=VREG || !VATTR_IS_SUPPORTED(&va,va_data_size) || va.va_data_size!=size)) error=EINVAL;
++    char buf[1024];
++    for (size_t pos=0; !error && pos<size;) {
++        int len=(int)((size-pos)>sizeof(buf)?sizeof(buf):size-pos),resid=0;
++        error=vn_rdwr(UIO_READ,vp,buf,len,(off_t)pos,UIO_SYSSPACE,IO_NOAUTH,
++            vfs_context_ucred(ctx),&resid,vfs_context_proc(ctx));
++        if (!error && (resid || memcmp(buf,data+pos,len))) error=EIO;
++        pos+=len;
++    }
++    vnode_close(vp,FREAD,ctx); return error;
++}
++
++/* The folders PATH's file goes in, those that are not there yet made. */
++static int
++sweet_file_folders(const char *path)
++{
++	char folder[1024];
++	size_t length = strlcpy(folder, path, sizeof(folder));
++
++	for (size_t i = 1; i < length && i < sizeof(folder); i++) {
++		if (folder[i] != '/') {
++			continue;
++		}
++		folder[i] = '\0';
++		int error = sweet_kernel_mkdir(folder, 0755);
++		if (error == 0) {
++			printf("SWEET FILES: %s: folder made\n", folder);
++		} else if (error != EEXIST) {
++			printf("SWEET FILES: %s: folder NOT made (error %d)\n", folder, error);
++			return error;
++		}
++		folder[i] = '/';
++	}
++	return 0;
++}
++
++static int
++sweet_file_write(const char *path, const uint8_t *data, size_t size)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	int mode = strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644;
++	int error;
++
++	error = vnode_open(path, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++	if (error == ENOENT && sweet_file_folders(path) == 0) {
++		error = vnode_open(path, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++	}
++	if (error == EEXIST) return sweet_file_verify(path,data,size);
++	if (error != 0) {
++		return error;
++	}
++	/* in pieces: vn_rdwr takes an int length */
++	for (size_t done = 0; done < size && error == 0;) {
++		size_t chunk = size - done > (1u << 20) ? (1u << 20) : size - done;
++		int resid = 0;
++
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)(uintptr_t)(data + done), (int)chunk, (off_t)done,
++		    UIO_SYSSPACE, IO_NOAUTH | IO_SYNC, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		done += chunk;
++	}
++	vnode_close(vp, FWRITE, ctx);
++	return error ? error : sweet_file_verify(path,data,size);
++}
++
++void
++sweet_files_install(void)
++{
++	uint32_t enabled = 0;
++	DTEntry node;
++
++	(void)PE_parse_boot_argn("sweetfiles", &enabled, sizeof(enabled));
++	if (enabled != 1 || SecureDTLookupEntry(NULL, "/sweet-files", &node) != kSuccess) {
++		return;
++	}
++	unsigned seen=0; bool failed=false;
++	for (unsigned i = 0; i < 3; i++) {
++		char name[16];
++		const void *prop = NULL;
++		unsigned int size = 0;
++
++		snprintf(name, sizeof(name), "file%u", i);
++		if (SecureDTGetProperty(node, name, &prop, &size) != kSuccess) {
++			break;
++		}
++		const char *path = prop;
++		size_t len = strnlen(path, size < 1024 ? size : 1024);
++		if (len == 0 || len >= size || len >= 1024 || !sweet_file_allowed(path) || strcmp(path,allowed_files[i])) {
++			printf("SWEET FILES: %s: not a path that may be written; not written\n", name);
++			failed=true; continue;
++		}
++		const uint8_t *data = (const uint8_t *)prop + len + 1;
++		size_t bytes = size - len - 1;
++		int error = bytes == 0 || bytes > (20u<<20) ? EINVAL : sweet_file_write(path, data, bytes);
++		seen++; if (error) failed=true;
++		printf("SWEET FILES: %s: %zu bytes %s (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written", error);
++	}
++	alioth_files_ready=seen==3 && !failed;
++	printf("ALIGPU FILES: verified=%u ready=%u\n",seen,alioth_files_ready);
++}
++
++#endif /* ARM64_BOARD_CONFIG_SWEET */
