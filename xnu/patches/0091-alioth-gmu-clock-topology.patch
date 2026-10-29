@@ -1,0 +1,36 @@
+--- a/bsd/dev/alioth_cx_clocks.c
++++ b/bsd/dev/alioth_cx_clocks.c
+@@ -76,9 +76,12 @@
+     if ((gdsc & 2) || (rcg & 1) || !(gmu & ON) || (gmu & 1)) return -2;
+     /* Check every register we intend to modify before the first write. */
+     const uint32_t gcc[]={0x52000,0x7100c,0x71018,0x71154};
+-    const uint32_t cc[]={0x1124,0x109c,0x1078,0x1088,0x108c,0x5000};
++    /* Alioth GMU apb_pclk is AOP QDSS (DT provider0x48,index0), NOT
++     * GPUCC CX_APB(+1088). Do not request or depend on that unused branch.
++     * AOP QMP remains a separate prerequisite before GMU access. */
++    const uint32_t cc[]={0x1124,0x109c,0x1078,0x108c,0x5000};
+     for(unsigned i=0;i<4;++i) if(readv(io,0,gcc[i],r,&v)) return -3;
+-    for(unsigned i=0;i<6;++i) if(readv(io,1,cc[i],r,&v)) return -3;
++    for(unsigned i=0;i<5;++i) if(readv(io,1,cc[i],r,&v)) return -3;
+     r->stage=2;
+     if ((gdsc & 1) && ((gdsc|hw)&ON)) return -2;
+     if (!(gdsc & 1) && !((gdsc|hw)&ON)) return -2;
+@@ -105,7 +108,7 @@
+     if((e=poll(io,1,0x1120,1,0,100,r))) return e;
+     if((e=poll(io,1,0x1124,0x371f,0x602,100,r))) return e;
+     r->stage=5;
+-    for(unsigned i=1;i<6;++i) {
++    for(unsigned i=1;i<5;++i) {
+         if((e=update(io,1,cc[i],1,1,r))) return e;
+         /* Voted/HW-gated branches are checked for enable only. */
+         if(cc[i]==0x109c && (e=poll(io,1,cc[i],ON,0,100,r))) return e;
+--- a/bsd/dev/alioth_gpu_memtest.c
++++ b/bsd/dev/alioth_gpu_memtest.c
+@@ -191,6 +191,7 @@
+     if (rc == 0 && PE_parse_boot_argn("aligpucx", &cx_enabled, sizeof(cx_enabled)) && cx_enabled == 1) {
+         int cx_rc = alioth_gpu_cx_start();
+         printf("ALIGPU CXTEST: result=%d firmware=0 gx=0\n", cx_rc);
++        printf("ALIGPU CLOCKPATH: apb=AOP-QDSS aop_configured=0 gmu_access=0\n");
+     }
+     (void)thread_terminate(current_thread());
+     thread_block(THREAD_CONTINUE_NULL);
