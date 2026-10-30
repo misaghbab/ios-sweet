@@ -1,0 +1,62 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -17,8 +17,8 @@
+  *      +0x104 enabled layer mask
+  *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
+- *      button / auto-lock), else on. Off fades the panel out over a few
+- *      vsyncs (halving each pixel) and keeps it black until on again;
++ *      button / auto-lock), else on. Off clears the framebuffer once and
++ *      keeps it black until on again;
+  *      the panel itself stays powered (AMOLED black pixels are off).
+  *   18 IsMainDisplay,
+  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
+@@ -116,7 +116,7 @@
+ 	bool          fDirty;
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+-	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	bool          fBlanked;       /* framebuffer cleared for this off transition */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+@@ -233,20 +233,16 @@
+ 		client->notify(SWEET_FB_NOTIFY_VSYNC, values, 6);
+ 	}
+ 	if (fb->fPowerOff) {
+-		/* Fade out: halve every channel each vsync, then black, then idle. */
+-		uint32_t step = fb->fFadeStep;
+-		if (step <= 6) {
+-			fb->fFadeStep = step + 1;
+-		}
+-		IOLockUnlock(fb->fLock);
+-		if (step <= 6) {
+-			for (uint32_t y = 0; y < fb->fHeight; y++) {
+-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+-				for (uint32_t x = 0; x < fb->fWidth; x++) {
+-					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
+-				}
+-			}
+-		}
++        /* The old seven read/modify/write passes visibly swept down the panel.
++         * Clear normal framebuffer memory once, using the optimized zero routine.
++         * This blanks the image; it does not switch off DSI or panel power.
++         */
++        bool blank = !fb->fBlanked;
++        fb->fBlanked = true;
++        IOLockUnlock(fb->fLock);
++        if (blank) {
++            bzero((void *)fb->fPixels, (size_t)fb->fRowBytes * fb->fHeight);
++        }
+ 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ 		return;
+ 	}
+@@ -582,7 +578,7 @@
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
+-				fFB->fFadeStep = 0;
++				fFB->fBlanked = false;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);
