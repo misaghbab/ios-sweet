@@ -1,0 +1,50 @@
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -22,7 +22,7 @@
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+ 
+-Only three graphics libraries; sweetfiles=1 required. Creates missing files;
++Three graphics libraries and an optional ExtensionKit setting; sweetfiles=1 required. Creates missing files;
+ existing files must match byte-for-byte. Installs before launchd, persists on root.
+ */
+ #include <pexpert/arm64/board_config.h>
+@@ -132,6 +132,30 @@
+ 	return error ? error : sweet_file_verify(path,data,size);
+ }
+ 
++
++/* Optional wallpaper extension support. A conflicting existing preference must
++ * never disable the independently verified graphics libraries. No cache deletion.
++ * Carry exactly this reviewed plist; do not accept arbitrary preference payloads.
++ */
++static void
++alioth_wallpaper_install(DTEntry node)
++{
++    static const char path[] = "/private/var/preferences/FeatureFlags/Domain/ExtensionKit.plist";
++    static const char expected[] =
++        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
++        "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
++        "<plist version=\"1.0\"><dict><key>enforce_xpc_cache_code_signing</key>"
++        "<dict><key>Enabled</key><false/></dict></dict></plist>\n";
++    const void *prop = NULL;
++    unsigned int size = 0;
++    if (SecureDTGetProperty(node, "wallpaper-extensionkit", &prop, &size) != kSuccess) return;
++    int error = EINVAL;
++    if (size == sizeof(expected)-1 && !memcmp(prop, expected, size))
++        error = sweet_file_write(path, prop, size);
++    printf("ALIOTH WALLPAPER: ExtensionKit preference %s (error %d)\n",
++        error == 0 ? "verified" : "not installed", error);
++}
++
+ void
+ sweet_files_install(void)
+ {
+@@ -165,6 +189,7 @@
+ 		printf("SWEET FILES: %s: %zu bytes %s (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written", error);
+ 	}
+ 	alioth_files_ready=seen==3 && !failed;
++	if (alioth_files_ready) alioth_wallpaper_install(node);
+ 	printf("ALIGPU FILES: verified=%u ready=%u\n",seen,alioth_files_ready);
+ }
+ 
