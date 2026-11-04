@@ -1,0 +1,128 @@
+--- a/iokit/Kernel/arm/SweetNetworkStack.cpp
++++ b/iokit/Kernel/arm/SweetNetworkStack.cpp
+@@ -23,10 +23,13 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IOUserClient.h>
++#include <IOKit/IORegistryEntry.h>
++#include <libkern/c++/OSKext.h>
+ #include <sys/systm.h>
+ #include <sys/proc.h>
+ 
+ extern "C" void SweetNetworkStackStart(void);
++extern "C" void SweetIOKitDaemonStandIn(void);
+ 
+ class IONetworkStack : public IOService
+ {
+@@ -62,6 +65,66 @@
+ 
+ OSDefineMetaClassAndStructors(IONetworkStackUserClient, IOUserClient);
+ 
++/*
++ * Boot 55: configd opened this with the registry busy (1), and still waited its 300 s: the
++ * namer publishes "*QUIET*" only when the whole registry is idle, so something stays busy. Which
++ * services are busy (the busiest leaves: busy, with no busy child) is said 20, 60 and 120 s after
++ * configd opened the stack.
++ */
++static void
++sayBusy(unsigned seconds)
++{
++	IOService * root = IOService::getServiceRoot();
++	unsigned shown = 0;
++
++	IOLog("SweetNetworkStack: %u s after configd: the registry's busy state is %u\n", seconds,
++	    (unsigned) root->getBusyState());
++	if (root->getBusyState() == 0) {
++		return;
++	}
++	IORegistryIterator * all = IORegistryIterator::iterateOver(root, gIOServicePlane, kIORegistryIterateRecursively);
++	if (all == NULL) {
++		return;
++	}
++	IORegistryEntry * entry;
++	while ((entry = all->getNextObject()) != NULL && shown < 12) {
++		IOService * service = OSDynamicCast(IOService, entry);
++		if (service == NULL || service->getBusyState() == 0) {
++			continue;
++		}
++		bool busyChild = false;
++		OSIterator * children = service->getChildIterator(gIOServicePlane);
++		if (children != NULL) {
++			OSObject * child;
++			while (!busyChild && (child = children->getNextObject()) != NULL) {
++				IOService * other = OSDynamicCast(IOService, child);
++				busyChild = other != NULL && other->getBusyState() != 0;
++			}
++			children->release();
++		}
++		if (!busyChild) {
++			IOLog("SweetNetworkStack: %u s after configd: BUSY: %s (class %s, busy %u)\n", seconds, service->getName(),
++			    service->getMetaClass()->getClassName(), (unsigned) service->getBusyState());
++			shown++;
++		}
++	}
++	all->release();
++}
++
++static void
++watchBusy(void * argument)
++{
++	static const unsigned at[] = { 20, 60, 120 };
++	unsigned waited = 0;
++
++	for (unsigned i = 0; i < sizeof(at) / sizeof(at[0]); i++) {
++		IOSleep((at[i] - waited) * 1000);
++		waited = at[i];
++		sayBusy(at[i]);
++	}
++	IOExitThread();
++}
++
+ bool
+ IONetworkStackUserClient::start(IOService * provider)
+ {
+@@ -74,6 +137,11 @@
+ 	proc_selfname(who, sizeof(who));
+ 	IOLog("SweetNetworkStack: opened by %s; the registry's busy state is %u\n", who,
+ 	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	static bool watching;
++	if (!watching) {
++		watching = true;
++		(void) IOCreateThread(watchBusy, NULL);
++	}
+ 	return true;
+ }
+ 
+@@ -100,6 +168,32 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++/*
++ * Boot 56: the registry stayed busy (1) with no busy service under its root. That is the count
++ * StartIOKitMatching() adds to the root "until the IOKit daemon has completely finished launching"
++ * (IOStartIOKit.cpp): this kernel is built with the macOS SDK (!NO_KEXTD), so it waits for
++ * kernelmanagerd, which an iOS root does not have (an iOS kernel, NO_KEXTD, never adds the count).
++ * The registry never went quiet, so configd's interface namer never said "*QUIET*" and everything
++ * behind SCNetworkInterfaceCopyAll() waited its 300 s (wifid, Settings). So the daemon's arrival is
++ * stood in for, once, as early as sweet_wifi_init() runs (bsd_init, after PE_init_iokit's
++ * StartIOKitMatching): the deferred matches start, the root's count goes, IOUserResources gets
++ * "IOKit", as when kernelmanagerd checks in. (Not when the kernel has no daemon to wait for:
++ * boot-arg -restore.)
++ */
++void
++SweetIOKitDaemonStandIn(void)
++{
++	static bool done;
++
++	if (done || !OSKext::iokitDaemonAvailable()) {
++		return;
++	}
++	done = true;
++	IOLog("SweetNetworkStack: no IOKit daemon on iOS: its arrival is stood in for (the registry's busy state %u)\n",
++	    (unsigned) IOService::getServiceRoot()->getBusyState());
++	IOService::iokitDaemonLaunched();
++}
++
+ void
+ SweetNetworkStackStart(void)
+ {
