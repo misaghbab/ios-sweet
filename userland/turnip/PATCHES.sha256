@@ -1,0 +1,8 @@
+77e966b6e9a725892d10889a4d8deeefb03a32ae3a007904868132e56350191f  patches/00-freedreno-tools-nir.patch
+be3ca7840a16cb7696d8d7e67195c8d097cf0e38a3b5011edc674a5aed9c6975  patches/01-ir3-darwin-build-id.patch
+bfc5552bc2bd6e1668d75773cce7bf62fd19065e6281bf7da49f9ddfc2e79339  patches/02-ir3-portable-asm-roundtrip.patch
+b7d7a113beb5ef99edea24858d906194d4b4755c987520545ad2f7f3136bb4fb  patches/03-offline-adreno-compiler-probe.patch
+f3bc6d470f8e0bde1b1d0d370175ec105ee45fe50075e43279581e61b1455c2b  patches/04-turnip-darwin-kmd.patch
+07f397e38d9acfb0085db4c19567c84fd8a3bcd63d6fd05192857abfbde5aed2  patches/05-turnip-graphics-cache-feedback.patch
+dec657626dcd8e8d3f1447e44574f31e4afb8c90b6ebf7d589ba10ee0f8b6461  patches/06-turnip-empty-scissor.patch
+3c606dc99643c3ca3e4736c5783348cd85cbff3fbc55161e53226ab459f34473  patches/07-turnip-builtin-shader-pack.patch

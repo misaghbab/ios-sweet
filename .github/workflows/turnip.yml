@@ -1,0 +1,25 @@
+name: turnip-ios
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools
+        run: brew install bison flex
+      - name: Build pinned Turnip for iOS 16
+        run: bash userland/turnip/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alioth-turnip-experimental
+          path: out-turnip/
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: turnip-build-logs
+          path: |
+            turnip-work/*.log
+            turnip-work/build-ios/meson-logs/
+
