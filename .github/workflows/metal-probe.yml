@@ -1,0 +1,26 @@
+name: metal-probe
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build diagnostic (does not install or activate Metal)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          xcrun --sdk iphoneos clang -arch arm64 -miphoneos-version-min=16.0 \
+            -fobjc-arc -fblocks -O2 -Wall -Wextra -Werror \
+            -framework Foundation -framework Metal -framework IOSurface \
+            userland/metal-probe/metal-probe.m -o out/alioth-metal-probe
+          codesign -f -s - out/alioth-metal-probe
+          codesign --verify out/alioth-metal-probe
+          otool -L out/alioth-metal-probe
+          cd out
+          shasum -a 256 alioth-metal-probe > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alioth-metal-probe
+          path: out/
