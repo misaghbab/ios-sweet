@@ -54,11 +54,11 @@ int main(void)
             if (bytes[i] != 0x5a) return fail("buffer readback mismatch");
 
         NSDictionary *properties = @{
-            (NSString *)kIOSurfaceWidth: @16, (NSString *)kIOSurfaceHeight: @16,
-            (NSString *)kIOSurfaceBytesPerElement: @4,
-            (NSString *)kIOSurfaceBytesPerRow: @64,
-            (NSString *)kIOSurfaceAllocSize: @1024,
-            (NSString *)kIOSurfacePixelFormat: @(0x42475241)
+            (__bridge NSString *)kIOSurfaceWidth: @16, (__bridge NSString *)kIOSurfaceHeight: @16,
+            (__bridge NSString *)kIOSurfaceBytesPerElement: @4,
+            (__bridge NSString *)kIOSurfaceBytesPerRow: @64,
+            (__bridge NSString *)kIOSurfaceAllocSize: @1024,
+            (__bridge NSString *)kIOSurfacePixelFormat: @(0x42475241)
         };
         IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)properties);
         if (!surface) return fail("IOSurface creation");
@@ -75,3 +75,4 @@ int main(void)
         return 0;
     }
 }
+
