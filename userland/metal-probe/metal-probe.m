@@ -1,7 +1,13 @@
 /* Diagnostic gate for an experimental Metal backend; does not install a driver. */
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
-#import <IOSurface/IOSurface.h>
+#import <CoreFoundation/CoreFoundation.h>
+/* iPhoneOS SDK ships the framework stubs but omits the IOSurface C headers. */
+typedef struct __IOSurface *IOSurfaceRef;
+extern IOSurfaceRef IOSurfaceCreate(CFDictionaryRef properties);
+extern const CFStringRef kIOSurfaceWidth, kIOSurfaceHeight;
+extern const CFStringRef kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow;
+extern const CFStringRef kIOSurfaceAllocSize, kIOSurfacePixelFormat;
 #include <dispatch/dispatch.h>
 #include <stdio.h>
 #include <string.h>
