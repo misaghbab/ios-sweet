@@ -52,7 +52,7 @@ export SDKROOT="$(xcrun --sdk iphoneos --show-sdk-path)"
 cargo +1.98.0 generate-lockfile --manifest-path "$BUILD/Cargo.toml" 2>&1 | tee "$WORK/resolve.log"
 cargo +1.98.0 build --locked --release --manifest-path "$BUILD/Cargo.toml" --target aarch64-apple-ios --target-dir "$WORK/target" 2>&1 | tee "$WORK/build.log"
 LIB=$WORK/target/aarch64-apple-ios/release/libnative_metal_bridge.a
-xcrun lipo -verify_arch arm64 "$LIB"
+xcrun lipo "$LIB" -verify_arch arm64
 xcrun nm -gU "$LIB" > "$WORK/symbols.txt"
 grep -q '_nmb_selftest' "$WORK/symbols.txt"
 cp "$LIB" "$OUT/"
