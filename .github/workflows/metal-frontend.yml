@@ -1,0 +1,38 @@
+name: metal-frontend-ios
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: alioth-metal-bridge-experimental
+          run-id: 42217006446
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: metal-frontend-work/deps/bridge
+      - uses: actions/download-artifact@v4
+        with:
+          name: alioth-turnip-experimental
+          run-id: 42111679443
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: metal-frontend-work/deps/turnip
+      - name: Link and sign experimental frontend
+        run: bash userland/metal-frontend/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alioth-metal-frontend-experimental
+          path: out-metal-frontend/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-frontend-logs
+          path: |
+            metal-frontend-work/*.log
+            metal-frontend-work/symbols.txt
