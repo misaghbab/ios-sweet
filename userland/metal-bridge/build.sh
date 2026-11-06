@@ -13,12 +13,17 @@ if [ ! -f "$WORK/prepared" ]; then
   curl --fail --location --retry 3 "https://codeload.github.com/steelbrain/metal2vulkan/tar.gz/$PIN" -o "$WORK/source.tar.gz"
   echo "6232a3df14ba9a666742fe6fde8cf8b4967eb2d438e6b7244659b23cb0fd80a1  $WORK/source.tar.gz" | shasum -a 256 -c -
   tar -xzf "$WORK/source.tar.gz" -C "$WORK"
+  # Prevent git apply from discovering the enclosing ios-sweet repository and
+  # silently skipping dependency paths outside its current subdirectory.
+  git -C "$SRC" init --quiet
   (cd "$HERE" && shasum -a 256 -c PATCHES.sha256)
   for p in "$HERE"/patches/*.patch; do
     (cd "$SRC" && git apply --check "$p" && git apply "$p")
   done
   touch "$WORK/prepared"
 fi
+grep -q 'pub fn references_resource' "$SRC/crates/metal2vulkan-runtime/src/used_resources.rs"
+grep -q 'BLOCK_BYTES: u64 = 8 << 20' "$SRC/crates/metal2vulkan-runtime/src/memory.rs"
 LLVM_AS="$(brew --prefix llvm)/bin/llvm-as"
 "$LLVM_AS" -o "$WORK/runtime_examples.air" "$SRC/crates/metal2vulkan-validation/fixtures/public/examples/runtime_examples.ll"
 "$LLVM_AS" -o "$WORK/function_constant.air" "$SRC/crates/metal2vulkan-validation/fixtures/public/kernel_function_constant_gate_fold.ll"
@@ -55,7 +60,7 @@ cp "$BUILD/Cargo.lock" "$OUT/"
 cp "$HERE/LICENSE" "$OUT/LICENSE-bridge"
 cp "$SRC"/LICENSE* "$OUT/"
 # Include the exact modified dependency and bridge sources for reproducibility.
-tar -czf "$OUT/metal2vulkan-source.tar.gz" -C "$WORK" "metal2vulkan-$PIN"
+tar --exclude=.git -czf "$OUT/metal2vulkan-source.tar.gz" -C "$WORK" "metal2vulkan-$PIN"
 tar -czf "$OUT/bridge-source.tar.gz" -C "$ROOT" userland/metal-bridge
 printf 'metal2vulkan=%s\nflame=%s\n' "$PIN" 745c4341af86089efb0df851fa8a27fb8face624 > "$OUT/SOURCES.txt"
 (cd "$OUT" && shasum -a 256 *.a *.tar.gz Cargo.lock SOURCES.txt > SHA256SUMS)
