@@ -1,0 +1,383 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -221,6 +221,9 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++// Diagnostic buffer client; deliberately not the Metal accelerator service.
++#include "SweetNativeMemory.inc"
++
+ class SweetGPU : public IOService
+ {
+ 	OSDeclareDefaultStructors(SweetGPU);
+@@ -262,6 +265,7 @@
+ 		gpu->detach(provider);
+ 		IOLog("SweetGPU: the service did not start\n");
+ 	}
++	startNativeMemory(provider);
+ 	gpu->release();
+ }
+ 
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNativeMemory.inc
+@@ -0,0 +1,192 @@
++/* Diagnostic NativeAdreno buffer bring-up. No submissions, imports, or Metal
++ * discovery are exposed here. Enable explicitly with sweetnativebuf=1.
++ * Lock order: per-client lock, then gGPULock. Never the reverse. */
++#include <pexpert/pexpert.h>
++#include "NativeAdrenoABI.h"
++extern "C" bool sweet_gpu_address_reserve(uint64_t, uint64_t);
++enum { NATIVE_SLOTS = 128 };
++static const uint64_t nativeWindowSize = 256ull << 20;
++static const uint64_t nativeMaxBuffer = 64ull << 20;
++
++struct native_memory_bo {
++    IOBufferMemoryDescriptor *memory;
++    uint64_t size, charged, iova;
++    uint32_t handle;
++};
++
++class SweetNativeMemoryUserClient : public IOUserClient {
++    OSDeclareDefaultStructors(SweetNativeMemoryUserClient);
++    IOLock *fLock;
++    native_memory_bo *fBO;
++    uint64_t fWindow, fCharged;
++    uint32_t fSerial;
++    bool fClosed;
++    native_memory_bo *find(uint64_t handle) {
++        if (!fBO || !handle || handle > UINT32_MAX) return NULL;
++        for (unsigned i=0; i<NATIVE_SLOTS; ++i)
++            if (fBO[i].memory && fBO[i].handle==handle) return &fBO[i];
++        return NULL;
++    }
++    void destroy(native_memory_bo *b) {
++        if (b->iova) {
++            IOLockLock(gGPULock);
++            sweet_gpu_unmap(b->iova,b->size);
++            IOLockUnlock(gGPULock);
++        }
++        fCharged-=b->charged;
++        b->memory->release();
++        bzero(b,sizeof(*b));
++    }
++    void closeMemory() {
++        if (!fLock) return;
++        IOLockLock(fLock);
++        if (!fClosed) {
++            fClosed=true;
++            if (fBO) for (unsigned i=0;i<NATIVE_SLOTS;++i)
++                if (fBO[i].memory) destroy(&fBO[i]);
++            if (fWindow) {
++                IOLockLock(gGPULock);
++                sweet_gpu_address_free(fWindow,nativeWindowSize);
++                IOLockUnlock(gGPULock);
++                fWindow=0;
++            }
++        }
++        IOLockUnlock(fLock);
++    }
++    IOReturn call(uint32_t method, IOExternalMethodArguments *a);
++public:
++    bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
++        if (!gGPULock || !sweet_gpu_ready() || !IOUserClient::start(provider)) return false;
++        fLock=IOLockAlloc();
++        fBO=IONewZero(native_memory_bo,NATIVE_SLOTS);
++        if (!fLock || !fBO) return false;
++        IOLockLock(gGPULock);
++        /* Disjoint 256MiB apertures, checked against existing OpenGL buffers. */
++        for (uint64_t p=0x20000000ull;p<0x100000000ull;p+=nativeWindowSize)
++            if (sweet_gpu_address_reserve(p,nativeWindowSize)) {fWindow=p;break;}
++        IOLockUnlock(gGPULock);
++        return fWindow!=0;
++    }
++    IOReturn clientClose() APPLE_KEXT_OVERRIDE {
++        closeMemory(); if (!isInactive()) terminate(); return kIOReturnSuccess;
++    }
++    void free() APPLE_KEXT_OVERRIDE {
++        closeMemory();
++        if (fBO) {IODelete(fBO,native_memory_bo,NATIVE_SLOTS);fBO=NULL;}
++        if (fLock) {IOLockFree(fLock);fLock=NULL;}
++        IOUserClient::free();
++    }
++    IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE {
++        if (!fLock || !options || !memory) return kIOReturnBadArgument;
++        *memory=NULL;
++        IOLockLock(fLock);
++        native_memory_bo *b=fClosed?NULL:find(type);
++        if (b) {b->memory->retain();*memory=b->memory;*options=0;}
++        IOLockUnlock(fLock);
++        return b?kIOReturnSuccess:kIOReturnBadArgument;
++    }
++    IOReturn externalMethod(uint32_t method,IOExternalMethodArguments *a,
++        IOExternalMethodDispatch *,OSObject *,void *) APPLE_KEXT_OVERRIDE {
++        if (!fLock || !a || a->scalarInputCount || a->scalarOutputCount ||
++            a->structureInputDescriptor || a->structureOutputDescriptor) return kIOReturnBadArgument;
++        IOLockLock(fLock);
++        IOReturn r=fClosed?kIOReturnNotOpen:call(method,a);
++        IOLockUnlock(fLock);return r;
++    }
++};
++OSDefineMetaClassAndStructors(SweetNativeMemoryUserClient,IOUserClient);
++
++IOReturn SweetNativeMemoryUserClient::call(uint32_t method,IOExternalMethodArguments *a)
++{
++    /* Exact wire sizes, no implicit short writes, no raw user-pointer access. */
++    size_t input=0,output=0;
++    switch(method) {
++    case 0: output=sizeof(uint64_t)*2;break; /* diagnostic aperture, NOT ABI Query */
++    case NativeAdrenoMethodBoAlloc: input=sizeof(NativeAdrenoAbiBoAlloc);output=sizeof(NativeAdrenoAbiBoAllocReply);break;
++    case NativeAdrenoMethodBoMap: input=sizeof(NativeAdrenoAbiBoMap);output=sizeof(NativeAdrenoAbiBoMapReply);break;
++    case NativeAdrenoMethodBoFree: input=sizeof(NativeAdrenoAbiBoFree);break;
++    case NativeAdrenoMethodBoCpuMap: input=sizeof(NativeAdrenoAbiBoCpuMap);output=sizeof(NativeAdrenoAbiBoCpuMapReply);break;
++    case NativeAdrenoMethodBoCpuUnmap: input=sizeof(NativeAdrenoAbiBoCpuUnmap);break;
++    default:return kIOReturnUnsupported;
++    }
++    if (a->structureInputSize!=input || a->structureOutputSize!=output ||
++        (input&&!a->structureInput) || (output&&!a->structureOutput)) return kIOReturnBadArgument;
++    if (!method) {
++        uint64_t reply[2]={fWindow,nativeWindowSize};memcpy(a->structureOutput,reply,sizeof reply);return kIOReturnSuccess;
++    }
++    if (method==NativeAdrenoMethodBoAlloc) {
++        NativeAdrenoAbiBoAlloc r;memcpy(&r,a->structureInput,sizeof r);
++        if (!r.bytes || r.bytes>nativeMaxBuffer || (r.bytes&4095) || r.contiguous ||
++            r.align_log2<12 || r.align_log2>24) return kIOReturnBadArgument;
++        uint64_t charged=round_page_64(r.bytes);
++        if (charged>nativeWindowSize-fCharged || fSerial==UINT32_MAX) return kIOReturnNoResources;
++        native_memory_bo *b=NULL;
++        for (unsigned i=0;i<NATIVE_SLOTS;++i) if (!fBO[i].memory) {b=&fBO[i];break;}
++        if (!b) return kIOReturnNoResources;
++        auto *md=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++            kIODirectionInOut|kIOMemoryKernelUserShared|kIOMapWriteCombineCache,
++            (vm_size_t)charged,(vm_size_t)(1ull<<r.align_log2));
++        if (!md) return kIOReturnNoMemory;
++        bzero(md->getBytesNoCopy(),(size_t)charged);
++        b->memory=md;b->size=r.bytes;b->charged=charged;b->handle=++fSerial;fCharged+=charged;
++        NativeAdrenoAbiBoAllocReply reply={b->handle};memcpy(a->structureOutput,&reply,sizeof reply);
++        return kIOReturnSuccess;
++    }
++    uint64_t handle;memcpy(&handle,a->structureInput,sizeof handle);
++    native_memory_bo *b=find(handle);if (!b) return kIOReturnBadArgument;
++    if (method==NativeAdrenoMethodBoFree) {destroy(b);return kIOReturnSuccess;}
++    if (method==NativeAdrenoMethodBoCpuMap) {
++        NativeAdrenoAbiBoCpuMapReply reply={b->handle,0,b->size};memcpy(a->structureOutput,&reply,sizeof reply);return kIOReturnSuccess;
++    }
++    if (method==NativeAdrenoMethodBoCpuUnmap) {
++        NativeAdrenoAbiBoCpuUnmap r;memcpy(&r,a->structureInput,sizeof r);
++        return !r.reserved && r.token==b->handle?kIOReturnSuccess:kIOReturnBadArgument;
++    }
++    NativeAdrenoAbiBoMap r;memcpy(&r,a->structureInput,sizeof r);
++    if (b->iova || r.reserved || (r.iova&4095) || r.iova<fWindow ||
++        r.iova-fWindow>=nativeWindowSize || b->size>nativeWindowSize-(r.iova-fWindow) ||
++        (r.permissions!=1 && r.permissions!=3) || r.writeback || r.shareability!=2) return kIOReturnBadArgument;
++    for (unsigned i=0;i<NATIVE_SLOTS;++i) {
++        const native_memory_bo *other=&fBO[i];
++        if (other->memory && other->iova && r.iova<other->iova+other->size && other->iova<r.iova+b->size)
++            return kIOReturnNoResources;
++    }
++    IOLockLock(gGPULock);
++    uint64_t mapped=0;
++    for (;mapped<b->size;mapped+=4096) {
++        IOByteCount length=0;
++        addr64_t phys=b->memory->getPhysicalSegment(mapped,&length,kIOMemoryMapperNone);
++        if (!phys || (phys&4095) || length<4096 || !sweet_gpu_map(r.iova+mapped,phys,r.permissions==1)) break;
++    }
++    if (mapped!=b->size) {
++        /* Unmap the entire validated range, including a possibly partial failed entry. */
++        sweet_gpu_unmap(r.iova,b->size);
++        IOLockUnlock(gGPULock);return kIOReturnNoMemory;
++    }
++    sweet_gpu_mapped();b->iova=r.iova;
++    IOLockUnlock(gGPULock);
++    NativeAdrenoAbiBoMapReply reply={b->iova};memcpy(a->structureOutput,&reply,sizeof reply);
++    return kIOReturnSuccess;
++}
++
++class SweetNativeMemory : public IOService {
++    OSDeclareDefaultStructors(SweetNativeMemory);
++public:
++    bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
++        if (!IOService::start(provider)) return false;
++        setProperty(kIOUserClientClassKey,"SweetNativeMemoryUserClient");
++        setName("SweetNativeMemory");registerService();return true;
++    }
++};
++OSDefineMetaClassAndStructors(SweetNativeMemory,IOService);
++static void startNativeMemory(IOService *provider)
++{
++    unsigned enabled=0;
++    if (!PE_parse_boot_argn("sweetnativebuf",&enabled,sizeof enabled) || enabled!=1) return;
++    auto *service=OSTypeAlloc(SweetNativeMemory);
++    if (!service) return;
++    if (service->init() && service->attach(provider)) {
++        if (!service->start(provider)) service->detach(provider);
++    }
++    service->release();
++}
+--- /dev/null
++++ b/iokit/Kernel/arm/NativeAdrenoABI.h
+@@ -0,0 +1,165 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef NATIVE_ADRENO_ABI_H
++#define NATIVE_ADRENO_ABI_H
++#include <stdint.h>
++
++/* Versioned kernel/user-client wire ABI for the native Adreno driver. This is
++ * NOT the Metal, IOKit or Turnip ABI and it does not describe an ioctl. The
++ * IOKit service will copy exactly these fixed-size records across its external
++ * methods. All fields are little endian; both participants are ARM64. Every
++ * array is inside one fixed record so a caller cannot pass a length that
++ * disagrees with the storage. Unknown versions, methods and flags are refused
++ * rather than ignored. */
++enum {
++    NativeAdrenoAbiVersion = 1,
++    NativeAdrenoAbiMaxBuffers = 16,
++    NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
++    NativeAdrenoMethodQuery = 1,
++    NativeAdrenoMethodBoAlloc = 2,
++    NativeAdrenoMethodBoMap = 3,
++    NativeAdrenoMethodBoFree = 4,
++    NativeAdrenoMethodSubmit = 5,
++    NativeAdrenoMethodWaitFence = 6,
++    NativeAdrenoMethodGetTimestamp = 7,
++    NativeAdrenoMethodGetStatus = 8,
++    NativeAdrenoMethodSetMetadata = 9,
++    NativeAdrenoMethodGetMetadata = 10,
++    NativeAdrenoMethodCreateQueue = 11,
++    NativeAdrenoMethodCloseQueue = 12,
++    NativeAdrenoMethodBoCpuMap = 13,
++    NativeAdrenoMethodBoCpuUnmap = 14,
++    NativeAdrenoMethodGetDeviceInfo = 15,
++    NativeAdrenoMethodBoImport = 16,
++    NativeAdrenoAbiMetadataBytes = 64,
++    NativeAdrenoAbiMaxQueues = 8
++};
++struct NativeAdrenoAbiParams {
++    uint32_t abi_version;
++    uint32_t input_bits;          /* GPU VA bits below 2^input_bits */
++    uint32_t output_bits;         /* physical address bits */
++    uint32_t flags;               /* NativeAdrenoParamsHostImport or zero */
++    uint64_t max_bo_bytes;
++};
++enum {
++    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
++};
++struct NativeAdrenoAbiBoAlloc {
++    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
++    uint32_t align_log2;          /* 12..24 */
++    uint32_t contiguous;          /* 1 requires one raw physical span */
++};
++struct NativeAdrenoAbiBoAllocReply {
++    uint64_t handle;              /* opaque to userspace, nonzero */
++};
++/* Pins [address, address + bytes) of the CALLING task and makes it a BO (reply: NativeAdrenoAbiBoAllocReply). The pages stay wired
++ * until BoFree; they keep the caller's own CPU mapping and cache mode, so the caller cleans its caches before GPU use and invalidates
++ * them after GPU writes (the GPU maps them non-cacheable). An imported BO has no CPU-map token. */
++struct NativeAdrenoAbiBoImport {
++    uint64_t address;             /* 4KiB aligned */
++    uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
++};
++struct NativeAdrenoAbiBoMap {
++    uint64_t handle;
++    uint64_t iova;                /* 4KiB aligned, inside the mounted aperture */
++    uint32_t permissions;         /* bit0 read, bit1 write; read required */
++    uint32_t writeback;           /* 0 normal non-coherent, 1 WB/WA */
++    uint32_t shareability;        /* 2 outer, 3 inner */
++    uint32_t reserved;            /* zero */
++};
++struct NativeAdrenoAbiBoMapReply {
++    uint64_t iova;
++};
++struct NativeAdrenoAbiBoFree {
++    uint64_t handle;
++};
++struct NativeAdrenoAbiSubmitBuffer {
++    uint64_t handle;
++    uint64_t iova;
++    uint64_t bytes;               /* 4-byte multiple, dword count = bytes/4 */
++};
++struct NativeAdrenoAbiSubmit {
++    uint32_t buffer_count;        /* 1..NativeAdrenoAbiMaxBuffers */
++    uint32_t reserved;            /* zero */
++    uint64_t queue;               /* open queue; 0 is created by open() */
++    uint64_t wait_fence;          /* zero or an earlier fence of this client */
++    uint64_t wait_timeout_ns;     /* used only when wait_fence is nonzero */
++    NativeAdrenoAbiSubmitBuffer buffers[NativeAdrenoAbiMaxBuffers];
++};
++struct NativeAdrenoAbiMetadata {
++    uint64_t handle;              /* object identity */
++    uint32_t bytes;               /* set: length; get: requested capacity */
++    uint32_t reserved;            /* zero */
++    char text[NativeAdrenoAbiMetadataBytes]; /* raw bytes, not NUL terminated */
++};
++struct NativeAdrenoAbiSubmitReply {
++    uint64_t fence;               /* nonzero CP timestamp value */
++};
++struct NativeAdrenoAbiWaitFence {
++    uint64_t fence;
++    uint64_t timeout_ns;          /* 0 polls once */
++};
++struct NativeAdrenoAbiTimestamp {
++    uint64_t ticks;               /* GPU always-on counter value */
++};
++struct NativeAdrenoAbiBoCpuMap {
++    uint64_t handle;
++};
++struct NativeAdrenoAbiBoCpuMapReply {
++    uint32_t token;               /* clientMemoryForType selector */
++    uint32_t reserved;            /* zero */
++    uint64_t bytes;               /* bytes the mapping covers */
++};
++struct NativeAdrenoAbiBoCpuUnmap {
++    uint64_t handle;
++    uint32_t token;               /* exactly the token returned by map */
++    uint32_t reserved;            /* zero */
++};
++struct NativeAdrenoAbiQueue {
++    uint64_t queue;               /* zero for create, an open id for close */
++};
++struct NativeAdrenoAbiQueueReply {
++    uint64_t queue;               /* nonzero id of the created queue */
++};
++struct NativeAdrenoAbiStatus {
++    uint64_t faults;              /* monotonic; change means context lost */
++    uint64_t suspends;            /* monotonic suspend/reset count */
++};
++/* Fixed facts of the mounted GPU that the Vulkan driver needs and cannot derive: all come from the board code, which takes
++ * them from the pinned sources (a6xx catalog, UBWC config, the programmed UCHE ranges), never from a guess. */
++enum {
++    NativeAdrenoDeviceClientIova = 1,     /* flags: the client chooses BO addresses (BoMap iova) */
++    NativeAdrenoDeviceCachedCoherent = 2  /* flags: unused until IO-coherent BO memory exists */
++};
++struct NativeAdrenoAbiDeviceInfo {
++    uint32_t chip_id;             /* ADRENO_CHIPID, e.g. 0x43050a01 */
++    uint32_t gmem_bytes;
++    uint64_t gmem_base;           /* UCHE GMEM window start (GPU address) */
++    uint64_t uche_trap_base;
++    uint64_t va_start;            /* first GPU address the client may map */
++    uint64_t va_size;
++    uint32_t highest_bank_bit;
++    uint32_t ubwc_swizzle;        /* bit0 level 1, bit1 level 2, bit2 level 3 */
++    uint32_t macrotile_mode;      /* 0 four channel, 1 eight channel */
++    uint32_t ubwc_version;        /* encoder version, 4 for UBWC 4.0 */
++    uint32_t flags;
++    uint32_t reserved;            /* zero */
++};
++#if defined(__cplusplus)
++static_assert(sizeof(NativeAdrenoAbiDeviceInfo) == 64, "ABI device info layout");
++static_assert(sizeof(NativeAdrenoAbiParams) == 24, "ABI params layout");
++static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
++static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
++static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
++static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
++static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
++static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
++static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
++static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");
++static_assert(sizeof(NativeAdrenoAbiQueue) == 8, "ABI queue layout");
++static_assert(sizeof(NativeAdrenoAbiQueueReply) == 8, "ABI queue reply layout");
++static_assert(sizeof(NativeAdrenoAbiMetadata) == 80, "ABI metadata layout");
++static_assert(sizeof(NativeAdrenoAbiWaitFence) == 16, "ABI wait layout");
++static_assert(sizeof(NativeAdrenoAbiTimestamp) == 8, "ABI timestamp layout");
++static_assert(sizeof(NativeAdrenoAbiStatus) == 16, "ABI status layout");
++#endif
++#endif

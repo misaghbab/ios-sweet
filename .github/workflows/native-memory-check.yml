@@ -1,0 +1,29 @@
+name: native-memory-compile-check
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: read
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: xnu-buildtree
+          run-id: 41908529235
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: native-check
+      - name: Extract pinned kernel build tree
+        run: |
+          mkdir -p native-check/tree
+          tar xzf native-check/buildtree.tgz -C native-check/tree
+      - name: Check patched GPU files with Apple compiler
+        run: python3 tools/check-native-memory.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: native-memory-compile-check
+          path: out-native-check/

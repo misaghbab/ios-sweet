@@ -1,0 +1,60 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1085,6 +1085,7 @@
+ bool sweet_gpu_ready(void);
+ bool sweet_gpu_parameter(uint32_t which, uint64_t *value);
+ uint64_t sweet_gpu_address(uint64_t size);
++bool sweet_gpu_address_reserve(uint64_t address, uint64_t size);
+ void sweet_gpu_address_free(uint64_t address, uint64_t size);
+ bool sweet_gpu_map(uint64_t address, uint64_t phys, bool read_only);
+ void sweet_gpu_mapped(void);
+@@ -1184,6 +1185,49 @@
+ 	}
+ 	return 0;
+ }
++
++/* Reserve a client aperture from the SAME free list as OpenGL buffers.
++ * Caller holds gGPULock. Only reserves address space: no page-table writes.
++ * Client suballocations must never be returned individually to this list.
++ * Release the whole aperture only after all mappings and fences retire. */
++bool
++sweet_gpu_address_reserve(uint64_t address, uint64_t size)
++{
++	if (size == 0 || (address & (KEPT_VA_GRANULE - 1u)) ||
++	    (size & (KEPT_VA_GRANULE - 1u)) || address < KEPT_VA_START ||
++	    address >= KEPT_VA_START + KEPT_VA_SIZE ||
++	    size > KEPT_VA_START + KEPT_VA_SIZE - address)
++		return false;
++	for (unsigned i = 0; i < kept_free_count; ++i) {
++		uint64_t start = kept_free[i].start, span = kept_free[i].size;
++		if (address < start || address - start > span || size > span - (address - start))
++			continue;
++		uint64_t left = address - start, right = span - left - size;
++		/* A middle split needs an extra slot. Failure must not change state. */
++		if (left && right && kept_free_count == KEPT_FREE_RUNS)
++			return false;
++		if (left && right) {
++			for (unsigned k = kept_free_count; k > i + 1; --k)
++				kept_free[k] = kept_free[k - 1];
++			kept_free[i].size = left;
++			kept_free[i + 1].start = address + size;
++			kept_free[i + 1].size = right;
++			++kept_free_count;
++		} else if (left) {
++			kept_free[i].size = left;
++		} else if (right) {
++			kept_free[i].start = address + size;
++			kept_free[i].size = right;
++		} else {
++			--kept_free_count;
++			for (unsigned k = i; k < kept_free_count; ++k)
++				kept_free[k] = kept_free[k + 1];
++		}
++		return true;
++	}
++	return false;
++}
++
+ 
+ void
+ sweet_gpu_address_free(uint64_t address, uint64_t size)
