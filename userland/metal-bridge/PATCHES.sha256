@@ -1,0 +1,7 @@
+4873084b07b44f7dd3dc3419fb8d758e275fd630435a3c7de3939219a41f5846  patches/m2v-0001-optional-constant-output-members.patch
+fc1d13dc6e8fbdb0f7bc5e7e5a8144e4e1a4a148586a89384d4ed7645b7c2712  patches/m2v-0002-resource-wait-storage-dependencies.patch
+f734b0811904ff096df4f7f0b44e410f0ad046af1bda8ee2a4b52363b3cd92ba  patches/m2v-0003-cache-device-entry-point-priming.patch
+1b00fe99626deffb1343b676d12c6929c4eafe9710f175ce97f13ffcc788a5c1  patches/m2v-0004-fold-constant-global-field-loads.patch
+03e9968db60fead33992d941a18f37291afc18b9fc981f388f844450c3ec35b4  patches/m2v-0005-keep-module-decodes-and-profile-fingerprints.patch
+3ee976e3e134c1f0fc1758c910fe75768a1338286ecf55970537fa783f3298cf  patches/m2v-0006-skip-draws-without-a-pipeline.patch
+9a9fdc8ef1050142c196c50fe22880db657f8c6c4c41b96706468024b6c94a00  patches/m2v-0100-sweet-8mb-memory-blocks.patch

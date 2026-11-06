@@ -1,0 +1,30 @@
+name: metal-bridge-ios
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LLVM and pinned Rust
+        run: |
+          brew install llvm
+          rustup toolchain install 1.98.0 --profile minimal --target aarch64-apple-ios
+      - name: Build iOS 16 Metal translator bridge
+        run: bash userland/metal-bridge/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: alioth-metal-bridge-experimental
+          path: out-metal-bridge/
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: metal-bridge-build-logs
+          path: |
+            metal-bridge-work/*.log
+            metal-bridge-work/Cargo.lock
+            metal-bridge-work/symbols.txt
