@@ -26,5 +26,5 @@ jobs:
           name: metal-bridge-build-logs
           path: |
             metal-bridge-work/*.log
-            metal-bridge-work/Cargo.lock
+            metal-bridge-work/bridge/Cargo.lock
             metal-bridge-work/symbols.txt
