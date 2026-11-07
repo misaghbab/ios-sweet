@@ -1,0 +1,89 @@
+--- a/iokit/Kernel/arm/SweetNativeMemory.inc
++++ b/iokit/Kernel/arm/SweetNativeMemory.inc
+@@ -169,6 +169,78 @@
+     return kIOReturnSuccess;
+ }
+ 
++/* Opt-in kernel-side smoke test of the diagnostic client. No command submission.
++ * Owns a private client and always releases its descriptors/window on exit. */
++static IOReturn nativeTestCall(SweetNativeMemoryUserClient *c, uint32_t method,
++    const void *in, size_t input, void *out, size_t output)
++{
++    IOExternalMethodArguments args = {};
++    args.structureInput=in; args.structureInputSize=input;
++    args.structureOutput=out; args.structureOutputSize=output;
++    return c->externalMethod(method,&args,NULL,NULL,NULL);
++}
++static void nativeMemoryBootTest(IOService *provider)
++{
++    unsigned enabled=0;
++    if (!PE_parse_boot_argn("sweetnativecheck",&enabled,sizeof enabled) || enabled!=1) return;
++    auto *c=OSTypeAlloc(SweetNativeMemoryUserClient);
++    bool attached=false,started=false;
++    IOMemoryDescriptor *memory=NULL;
++    const char *stage="init";
++    IOReturn status=kIOReturnError;
++    uint64_t window[2]={};
++    NativeAdrenoAbiBoAlloc alloc={16384,14,0};
++    NativeAdrenoAbiBoAllocReply first={},second={};
++    NativeAdrenoAbiBoMap mapping={};
++    NativeAdrenoAbiBoMapReply mapped={};
++    NativeAdrenoAbiBoFree release={};
++    IOOptionBits options=0;
++    if (!c || !c->initWithTask(kernel_task,NULL,0)) goto done;
++    attached=c->attach(provider); if (!attached) goto done;
++    started=c->start(provider); if (!started) goto done;
++#define NATIVE_TEST(call,label) do {stage=label;status=(call);if(status!=kIOReturnSuccess)goto done;}while(0)
++    NATIVE_TEST(nativeTestCall(c,0,NULL,0,window,sizeof window),"window");
++    NATIVE_TEST(nativeTestCall(c,2,&alloc,sizeof alloc,&first,sizeof first),"alloc1");
++    NATIVE_TEST(nativeTestCall(c,2,&alloc,sizeof alloc,&second,sizeof second),"alloc2");
++    mapping.handle=first.handle;mapping.iova=window[0];mapping.permissions=3;mapping.shareability=2;
++    NATIVE_TEST(nativeTestCall(c,3,&mapping,sizeof mapping,&mapped,sizeof mapped),"map");
++    stage="map reply";
++    if (mapped.iova!=window[0]) {status=kIOReturnError;goto done;}
++    mapping.handle=second.handle;stage="overlap";
++    status=nativeTestCall(c,3,&mapping,sizeof mapping,&mapped,sizeof mapped);
++    if (status!=kIOReturnNoResources) {status=kIOReturnError;goto done;}
++    NATIVE_TEST(c->clientMemoryForType((UInt32)first.handle,&options,&memory),"CPU descriptor");
++    {
++        auto *buffer=OSDynamicCast(IOBufferMemoryDescriptor,memory);
++        stage="CPU pattern";
++        if (!buffer || buffer->getLength()<alloc.bytes) {status=kIOReturnError;goto done;}
++        volatile uint32_t *words=(volatile uint32_t *)buffer->getBytesNoCopy();
++        for (unsigned i=0;i<alloc.bytes/4;++i) words[i]=0x51a70000u^i;
++        __asm__ volatile("dsb sy" ::: "memory");
++        for (unsigned i=0;i<alloc.bytes/4;++i)
++            if (words[i]!=(0x51a70000u^i)) {status=kIOReturnError;goto done;}
++    }
++    memory->release();memory=NULL;
++    release.handle=first.handle;
++    NATIVE_TEST(nativeTestCall(c,4,&release,sizeof release,NULL,0),"free1");
++    stage="stale handle";
++    status=nativeTestCall(c,4,&release,sizeof release,NULL,0);
++    if (status!=kIOReturnBadArgument) {status=kIOReturnError;goto done;}
++    release.handle=second.handle;
++    NATIVE_TEST(nativeTestCall(c,4,&release,sizeof release,NULL,0),"free2");
++    stage="complete";status=kIOReturnSuccess;
++done:
++    if (memory) memory->release();
++    if (c) {
++        if (started) c->stop(provider);
++        if (attached) c->detach(provider);
++        c->release(); /* free() cleans partial allocations and reserved window */
++    }
++    IOLog("NATIVEBUF: %s stage=%s status=%#x window=%#llx+%#llx; memory-only, no GPU execution\n",
++        status==kIOReturnSuccess?"PASS":"FAIL",stage,status,window[0],window[1]);
++#undef NATIVE_TEST
++}
++
+ class SweetNativeMemory : public IOService {
+     OSDeclareDefaultStructors(SweetNativeMemory);
+ public:
+@@ -187,6 +259,7 @@
+     if (!service) return;
+     if (service->init() && service->attach(provider)) {
+         if (!service->start(provider)) service->detach(provider);
++        else nativeMemoryBootTest(service);
+     }
+     service->release();
+ }
