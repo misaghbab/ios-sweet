@@ -1,0 +1,186 @@
+--- a/iokit/Kernel/arm/SweetNativeMemory.inc
++++ b/iokit/Kernel/arm/SweetNativeMemory.inc
+@@ -1,5 +1,5 @@
+-/* Diagnostic NativeAdreno buffer bring-up. Exposes only bounded buffer and
+- * command submission calls; import and Metal discovery are not ready yet.
++/* NativeAdreno path: bounded BOs, caller-owned page imports and GPU submission.
++ * Metal discovery remains experimental.
+  * Enable explicitly with sweetnativebuf=1.
+  * Lock order: per-client lock, then gGPULock. Never the reverse. */
+ #include <pexpert/pexpert.h>
+@@ -19,15 +19,17 @@
+ static const uint64_t nativeMaxBuffer = 64ull << 20;
+ 
+ struct native_memory_bo {
+-    IOBufferMemoryDescriptor *memory;
++    IOMemoryDescriptor *memory;
+     uint64_t size, charged, iova;
+     uint32_t handle;
++    bool imported, prepared;
+ };
+ 
+ class SweetNativeMemoryUserClient : public IOUserClient {
+     OSDeclareDefaultStructors(SweetNativeMemoryUserClient);
+     IOLock *fLock;
+     native_memory_bo *fBO;
++    task_t fTask;
+     uint64_t fWindow, fCharged;
+     uint32_t fSerial;
+     uint32_t fLastFence;
+@@ -44,6 +46,7 @@
+             sweet_gpu_unmap(b->iova,b->size);
+             IOLockUnlock(gGPULock);
+         }
++        if (b->prepared) { b->memory->complete(kIODirectionInOut); b->prepared=false; }
+         fCharged-=b->charged;
+         b->memory->release();
+         bzero(b,sizeof(*b));
+@@ -79,6 +82,10 @@
+         IOLockUnlock(gGPULock);
+         return fWindow!=0;
+     }
++    bool initWithTask(task_t owningTask,void *securityID,UInt32 type) APPLE_KEXT_OVERRIDE {
++        if (!IOUserClient::initWithTask(owningTask,securityID,type)) return false;
++        fTask=owningTask;return fTask!=NULL;
++    }
+     IOReturn clientClose() APPLE_KEXT_OVERRIDE {
+         closeMemory(); if (!isInactive()) terminate(); return kIOReturnSuccess;
+     }
+@@ -93,9 +100,9 @@
+         *memory=NULL;
+         IOLockLock(fLock);
+         native_memory_bo *b=fClosed?NULL:find(type);
+-        if (b) {b->memory->retain();*memory=b->memory;*options=0;}
++        if (b && !b->imported) {b->memory->retain();*memory=b->memory;*options=0;}
+         IOLockUnlock(fLock);
+-        return b?kIOReturnSuccess:kIOReturnBadArgument;
++        return b&&!b->imported?kIOReturnSuccess:kIOReturnBadArgument;
+     }
+     IOReturn externalMethod(uint32_t method,IOExternalMethodArguments *a,
+         IOExternalMethodDispatch *,OSObject *,void *) APPLE_KEXT_OVERRIDE {
+@@ -119,6 +126,7 @@
+     case NativeAdrenoMethodBoAlloc: input=sizeof(NativeAdrenoAbiBoAlloc);output=sizeof(NativeAdrenoAbiBoAllocReply);break;
+     case NativeAdrenoMethodBoMap: input=sizeof(NativeAdrenoAbiBoMap);output=sizeof(NativeAdrenoAbiBoMapReply);break;
+     case NativeAdrenoMethodBoFree: input=sizeof(NativeAdrenoAbiBoFree);break;
++    case NativeAdrenoMethodBoImport: input=sizeof(NativeAdrenoAbiBoImport);output=sizeof(NativeAdrenoAbiBoAllocReply);break;
+     case NativeAdrenoMethodSubmit: input=sizeof(NativeAdrenoAbiSubmit);output=sizeof(NativeAdrenoAbiSubmitReply);break;
+     case NativeAdrenoMethodWaitFence: input=sizeof(NativeAdrenoAbiWaitFence);break;
+     case NativeAdrenoMethodBoCpuMap: input=sizeof(NativeAdrenoAbiBoCpuMap);output=sizeof(NativeAdrenoAbiBoCpuMapReply);break;
+@@ -131,7 +139,7 @@
+         uint64_t reply[2]={fWindow,nativeWindowSize};memcpy(a->structureOutput,reply,sizeof reply);return kIOReturnSuccess;
+     }
+     if (method==NativeAdrenoMethodQuery) {
+-        NativeAdrenoAbiParams reply={NativeAdrenoAbiVersion,39,36,0,nativeMaxBuffer};
++        NativeAdrenoAbiParams reply={NativeAdrenoAbiVersion,39,36,NativeAdrenoParamsHostImport,nativeMaxBuffer};
+         memcpy(a->structureOutput,&reply,sizeof reply);return kIOReturnSuccess;
+     }
+     if (method==NativeAdrenoMethodGetDeviceInfo) {
+@@ -191,6 +199,24 @@
+         IOLockUnlock(gGPULock);
+         if (!fence) return kIOReturnBusy;
+         NativeAdrenoAbiSubmitReply reply={fence};memcpy(a->structureOutput,&reply,sizeof reply);
++        return kIOReturnSuccess;
++    }
++    if (method==NativeAdrenoMethodBoImport) {
++        NativeAdrenoAbiBoImport r;memcpy(&r,a->structureInput,sizeof r);
++        if (!fTask || !r.address || (r.address&4095) || !r.bytes || r.bytes>nativeMaxBuffer || (r.bytes&4095) ||
++            r.address>UINT64_MAX-r.bytes) return kIOReturnBadArgument;
++        uint64_t charged=round_page_64(r.bytes);
++        if (charged>nativeWindowSize-fCharged || fSerial==UINT32_MAX) return kIOReturnNoResources;
++        native_memory_bo *b=NULL;
++        for (unsigned i=0;i<NATIVE_SLOTS;++i) if (!fBO[i].memory) {b=&fBO[i];break;}
++        if (!b) return kIOReturnNoResources;
++        auto *memory=IOMemoryDescriptor::withAddressRange(r.address,r.bytes,kIODirectionInOut,fTask);
++        if (!memory) return kIOReturnBadArgument;
++        IOReturn prepared=memory->prepare(kIODirectionInOut);
++        if (prepared!=kIOReturnSuccess) return prepared;
++        b->memory=memory;b->size=r.bytes;b->charged=charged;
++        b->handle=++fSerial;b->imported=true;b->prepared=true;fCharged+=charged;
++        NativeAdrenoAbiBoAllocReply reply={b->handle};memcpy(a->structureOutput,&reply,sizeof reply);
+         return kIOReturnSuccess;
+     }
+     if (method==NativeAdrenoMethodBoAlloc) {
+@@ -215,6 +241,7 @@
+     native_memory_bo *b=find(handle);if (!b) return kIOReturnBadArgument;
+     if (method==NativeAdrenoMethodBoFree) {destroy(b);return kIOReturnSuccess;}
+     if (method==NativeAdrenoMethodBoCpuMap) {
++        if (b->imported) return kIOReturnUnsupported;
+         NativeAdrenoAbiBoCpuMapReply reply={b->handle,0,b->size};memcpy(a->structureOutput,&reply,sizeof reply);return kIOReturnSuccess;
+     }
+     if (method==NativeAdrenoMethodBoCpuUnmap) {
+@@ -327,12 +354,14 @@
+     if (!PE_parse_boot_argn("sweetnativecheck",&enabled,sizeof enabled) || enabled!=1) return;
+     auto *c=OSTypeAlloc(SweetNativeMemoryUserClient);
+     bool attached=false,started=false;
+-    IOMemoryDescriptor *ibMemory=NULL,*targetMemory=NULL;
++    IOMemoryDescriptor *ibMemory=NULL;
++    IOBufferMemoryDescriptor *hostTargetOwner=NULL;
+     const char *stage="init"; IOReturn status=kIOReturnError;
+     uint64_t window[2]={};
+     NativeAdrenoAbiParams params={}; NativeAdrenoAbiDeviceInfo info={};
+     NativeAdrenoAbiBoAlloc alloc={4096,12,0};
+     NativeAdrenoAbiBoAllocReply ib={},target={};
++    NativeAdrenoAbiBoImport hostImport={};
+     NativeAdrenoAbiBoMap mapping={}; NativeAdrenoAbiBoMapReply mapped={};
+     NativeAdrenoAbiSubmit submit={}; NativeAdrenoAbiSubmitReply submitted={};
+     NativeAdrenoAbiWaitFence wait={};
+@@ -345,7 +374,7 @@
+     NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodQuery,NULL,0,&params,sizeof params),"query");
+     stage="ABI params";
+     if (params.abi_version!=NativeAdrenoAbiVersion || params.input_bits!=39 || params.output_bits!=36 ||
+-        params.flags!=0 || params.max_bo_bytes!=nativeMaxBuffer) {status=kIOReturnError;goto done;}
++        params.flags!=NativeAdrenoParamsHostImport || params.max_bo_bytes!=nativeMaxBuffer) {status=kIOReturnError;goto done;}
+     NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodGetDeviceInfo,NULL,0,&info,sizeof info),"device info");
+     stage="A650 info";
+     if (info.chip_id!=0x06050002 || info.gmem_bytes!=0x120000 || info.gmem_base!=0 ||
+@@ -353,7 +382,16 @@
+         info.highest_bank_bit!=16 || info.ubwc_swizzle!=6 || info.macrotile_mode!=1 || info.ubwc_version!=4 ||
+         info.flags!=NativeAdrenoDeviceClientIova || info.reserved) {status=kIOReturnError;goto done;}
+     NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoAlloc,&alloc,sizeof alloc,&ib,sizeof ib),"alloc ib");
+-    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoAlloc,&alloc,sizeof alloc,&target,sizeof target),"alloc target");
++    {
++        auto *owner=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++            kIODirectionInOut|kIOMemoryKernelUserShared|kIOMapWriteCombineCache,4096,4096);
++        stage="alloc host owner";
++        if (!owner) {status=kIOReturnNoMemory;goto done;}
++        hostTargetOwner=owner;
++        bzero(hostTargetOwner->getBytesNoCopy(),4096);
++    }
++    hostImport.address=(uint64_t)(uintptr_t)hostTargetOwner->getBytesNoCopy();hostImport.bytes=4096;
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoImport,&hostImport,sizeof hostImport,&target,sizeof target),"import host");
+     mapping.handle=ib.handle; mapping.iova=window[0]; mapping.permissions=3; mapping.shareability=2;
+     NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoMap,&mapping,sizeof mapping,&mapped,sizeof mapped),"map ib");
+     if (mapped.iova!=mapping.iova) {stage="ib iova";status=kIOReturnError;goto done;}
+@@ -361,12 +399,10 @@
+     NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoMap,&mapping,sizeof mapping,&mapped,sizeof mapped),"map target");
+     if (mapped.iova!=mapping.iova) {stage="target iova";status=kIOReturnError;goto done;}
+     NATIVE_GPU_TEST(c->clientMemoryForType((UInt32)ib.handle,&options,&ibMemory),"map ib cpu");
+-    NATIVE_GPU_TEST(c->clientMemoryForType((UInt32)target.handle,&options,&targetMemory),"map target cpu");
+     {
+         auto *ibBuffer=OSDynamicCast(IOBufferMemoryDescriptor,ibMemory);
+-        auto *targetBuffer=OSDynamicCast(IOBufferMemoryDescriptor,targetMemory);
+         stage="CPU buffers";
+-        if (!ibBuffer || !targetBuffer || ibBuffer->getLength()<4096 || targetBuffer->getLength()<4096) {
++        if (!ibBuffer || !hostTargetOwner || ibBuffer->getLength()<4096 || hostTargetOwner->getLength()<4096) {
+             status=kIOReturnError;goto done;
+         }
+         const uint32_t magic=0x5eedad50u;
+@@ -378,14 +414,15 @@
+         NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodSubmit,&submit,sizeof submit,&submitted,sizeof submitted),"submit");
+         wait.fence=submitted.fence; wait.timeout_ns=2000000000ull;
+         NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodWaitFence,&wait,sizeof wait,NULL,0),"fence");
+-        sweet_gpu_to_memory((void *)targetBuffer->getBytesNoCopy(),4); __asm__ volatile("dsb sy" ::: "memory");
++        sweet_gpu_to_memory(hostTargetOwner->getBytesNoCopy(),4); __asm__ volatile("dsb sy" ::: "memory");
+         stage="GPU writeback";
+-        if (*(volatile uint32_t *)targetBuffer->getBytesNoCopy()!=magic) {status=kIOReturnError;goto done;}
++        if (*(volatile uint32_t *)hostTargetOwner->getBytesNoCopy()!=magic) {status=kIOReturnError;goto done;}
+     }
+     stage="complete"; status=kIOReturnSuccess;
+ done:
+-    if (ibMemory) ibMemory->release(); if (targetMemory) targetMemory->release();
++    if (ibMemory) ibMemory->release();
+     if (c) { if (started) c->stop(provider); if (attached) c->detach(provider); c->release(); }
++    if (hostTargetOwner) hostTargetOwner->release();
+     IOLog("NATIVEABI: %s stage=%s status=%#x fence=%llu\n",status==kIOReturnSuccess?"PASS":"FAIL",
+         stage,status,(unsigned long long)submitted.fence);
+ #undef NATIVE_GPU_TEST
