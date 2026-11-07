@@ -1,0 +1,33 @@
+--- a/iokit/Kernel/arm/SweetNativeMemory.inc
++++ b/iokit/Kernel/arm/SweetNativeMemory.inc
+@@ -4,7 +4,11 @@
+  * Lock order: per-client lock, then gGPULock. Never the reverse. */
+ #include <pexpert/pexpert.h>
+ #include "NativeAdrenoABI.h"
+-static uint32_t gpu_parity(uint32_t);
++static uint32_t native_gpu_parity(uint32_t v)
++{
++    return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^
++        (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
+ extern "C" bool sweet_gpu_address_reserve(uint64_t, uint64_t);
+ enum { NATIVE_SLOTS = 128 };
+ static const uint64_t nativeWindowSize = 256ull << 20;
+@@ -258,7 +262,7 @@
+     NativeAdrenoAbiBoAllocReply ib={},target={};
+     NativeAdrenoAbiBoMap mapping={}; NativeAdrenoAbiBoMapReply mapped={};
+     NativeAdrenoAbiSubmit submit={}; NativeAdrenoAbiSubmitReply submitted={};
+-    NativeAdrenoAbiWaitFence wait={}; NativeAdrenoAbiBoFree release={};
++    NativeAdrenoAbiWaitFence wait={};
+     IOOptionBits options=0;
+     if (!c || !c->initWithTask(kernel_task,NULL,0)) goto done;
+     attached=c->attach(provider); if (!attached) goto done;
+@@ -294,7 +298,7 @@
+         }
+         const uint32_t magic=0x5eedad50u;
+         volatile uint32_t *words=(volatile uint32_t *)ibBuffer->getBytesNoCopy();
+-        words[0]=(7u<<28)|3u|(gpu_parity(3)<<15)|(0x3du<<16)|(gpu_parity(0x3du)<<23);
++        words[0]=(7u<<28)|3u|(native_gpu_parity(3)<<15)|(0x3du<<16)|(native_gpu_parity(0x3du)<<23);
+         words[1]=(uint32_t)mapping.iova; words[2]=(uint32_t)(mapping.iova>>32); words[3]=magic;
+         sweet_gpu_to_memory((void *)ibBuffer->getBytesNoCopy(),16); sweet_gpu_to_memory(NULL,0);
+         submit.buffer_count=1; submit.queue=0; submit.buffers[0]={ib.handle,window[0],16};
