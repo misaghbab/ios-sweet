@@ -271,7 +271,7 @@ new file mode 100644
 index 0000000..b03c6ee
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -0,0 +1,1110 @@
+@@ -0,0 +1,1112 @@
 +/*
 + * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
 + * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
@@ -379,14 +379,16 @@ index 0000000..b03c6ee
 +static VkResult
 +dw_open_connection(struct tu_instance *instance)
 +{
-+   /* TU_DARWIN_SERVICE names the IOKit service (default: the AGX accelerator the original Metal discovery finds), TU_DARWIN_OPEN_TYPE its open
-+    * type (default 0x4147, the type the driver serves to the plugin). NativeAdrenoGpuPublished with type 0 is the unsandboxed direct form. */
++   /* Alioth publishes this user client as SweetNativeMemory and accepts ABI
++    * method selectors directly with open type 0. Keep both overrides for
++    * development against the reference service. */
 +   const char *service_name = getenv("TU_DARWIN_SERVICE");
 +   if (!service_name || !*service_name)
-+      service_name = "IOAcceleratorES";
++      service_name = "SweetNativeMemory";
 +   const char *type_text = getenv("TU_DARWIN_OPEN_TYPE");
-+   uint32_t open_type = type_text && *type_text ? (uint32_t)strtoul(type_text, NULL, 0) : 0x4147u;
-+   const bool direct = !strcmp(service_name, "NativeAdrenoGpuPublished");
++   uint32_t open_type = type_text && *type_text ? (uint32_t)strtoul(type_text, NULL, 0) : 0u;
++   const bool direct = !strcmp(service_name, "SweetNativeMemory") ||
++                       !strcmp(service_name, "NativeAdrenoGpuPublished");
 +   if (direct && !(type_text && *type_text))
 +      open_type = 0;
 +   io_service_t service = IOServiceGetMatchingService(
