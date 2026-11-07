@@ -1,0 +1,122 @@
+--- a/iokit/Kernel/arm/SweetNativeMemory.inc
++++ b/iokit/Kernel/arm/SweetNativeMemory.inc
+@@ -10,6 +10,10 @@
+         (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
+ }
+ extern "C" bool sweet_gpu_address_reserve(uint64_t, uint64_t);
++extern "C" bool sweet_gpu_parameter(uint32_t, uint64_t *);
++extern "C" void sweet_gpu_to_memory(void *, uint64_t);
++extern "C" uint32_t sweet_gpu_submit(const uint64_t *, const uint32_t *, uint32_t);
++extern "C" bool sweet_gpu_done(uint32_t);
+ enum { NATIVE_SLOTS = 128 };
+ static const uint64_t nativeWindowSize = 256ull << 20;
+ static const uint64_t nativeMaxBuffer = 64ull << 20;
+@@ -26,6 +30,7 @@
+     native_memory_bo *fBO;
+     uint64_t fWindow, fCharged;
+     uint32_t fSerial;
++    uint32_t fLastFence;
+     bool fClosed;
+     native_memory_bo *find(uint64_t handle) {
+         if (!fBO || !handle || handle > UINT32_MAX) return NULL;
+@@ -63,6 +68,7 @@
+ public:
+     bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
+         if (!gGPULock || !sweet_gpu_ready() || !IOUserClient::start(provider)) return false;
++        fLastFence=0;
+         fLock=IOLockAlloc();
+         fBO=IONewZero(native_memory_bo,NATIVE_SLOTS);
+         if (!fLock || !fBO) return false;
+@@ -108,9 +114,13 @@
+     size_t input=0,output=0;
+     switch(method) {
+     case 0: output=sizeof(uint64_t)*2;break; /* diagnostic aperture, NOT ABI Query */
++    case NativeAdrenoMethodQuery: output=sizeof(NativeAdrenoAbiParams);break;
++    case NativeAdrenoMethodGetDeviceInfo: output=sizeof(NativeAdrenoAbiDeviceInfo);break;
+     case NativeAdrenoMethodBoAlloc: input=sizeof(NativeAdrenoAbiBoAlloc);output=sizeof(NativeAdrenoAbiBoAllocReply);break;
+     case NativeAdrenoMethodBoMap: input=sizeof(NativeAdrenoAbiBoMap);output=sizeof(NativeAdrenoAbiBoMapReply);break;
+     case NativeAdrenoMethodBoFree: input=sizeof(NativeAdrenoAbiBoFree);break;
++    case NativeAdrenoMethodSubmit: input=sizeof(NativeAdrenoAbiSubmit);output=sizeof(NativeAdrenoAbiSubmitReply);break;
++    case NativeAdrenoMethodWaitFence: input=sizeof(NativeAdrenoAbiWaitFence);break;
+     case NativeAdrenoMethodBoCpuMap: input=sizeof(NativeAdrenoAbiBoCpuMap);output=sizeof(NativeAdrenoAbiBoCpuMapReply);break;
+     case NativeAdrenoMethodBoCpuUnmap: input=sizeof(NativeAdrenoAbiBoCpuUnmap);break;
+     default:return kIOReturnUnsupported;
+@@ -119,6 +129,69 @@
+         (input&&!a->structureInput) || (output&&!a->structureOutput)) return kIOReturnBadArgument;
+     if (!method) {
+         uint64_t reply[2]={fWindow,nativeWindowSize};memcpy(a->structureOutput,reply,sizeof reply);return kIOReturnSuccess;
++    }
++    if (method==NativeAdrenoMethodQuery) {
++        NativeAdrenoAbiParams reply={NativeAdrenoAbiVersion,39,36,0,nativeMaxBuffer};
++        memcpy(a->structureOutput,&reply,sizeof reply);return kIOReturnSuccess;
++    }
++    if (method==NativeAdrenoMethodGetDeviceInfo) {
++        uint64_t chip=0,gmem=0,gmemBase=0,hbb=0,swizzle=0,macro=0;
++        IOLockLock(gGPULock);
++        bool ok=sweet_gpu_parameter(0x03,&chip)&&sweet_gpu_parameter(0x02,&gmem)&&
++            sweet_gpu_parameter(0x06,&gmemBase)&&sweet_gpu_parameter(0x10,&hbb)&&
++            sweet_gpu_parameter(0x12,&swizzle)&&sweet_gpu_parameter(0x13,&macro);
++        IOLockUnlock(gGPULock);
++        if (!ok || chip>UINT32_MAX || gmem>UINT32_MAX || hbb>UINT32_MAX || swizzle>UINT32_MAX || macro>UINT32_MAX)
++            return kIOReturnNotReady;
++        NativeAdrenoAbiDeviceInfo reply={};
++        reply.chip_id=(uint32_t)chip;reply.gmem_bytes=(uint32_t)gmem;reply.gmem_base=gmemBase;
++        reply.uche_trap_base=0x1fffffffff000ull;reply.va_start=fWindow;reply.va_size=nativeWindowSize;
++        reply.highest_bank_bit=(uint32_t)hbb;reply.ubwc_swizzle=(uint32_t)swizzle;
++        reply.macrotile_mode=(uint32_t)macro;reply.ubwc_version=4;reply.flags=NativeAdrenoDeviceClientIova;
++        memcpy(a->structureOutput,&reply,sizeof reply);return kIOReturnSuccess;
++    }
++    if (method==NativeAdrenoMethodWaitFence) {
++        NativeAdrenoAbiWaitFence r;memcpy(&r,a->structureInput,sizeof r);
++        if (!r.fence || r.fence>UINT32_MAX || (int32_t)(fLastFence-(uint32_t)r.fence)<0) return kIOReturnBadArgument;
++        uint64_t timeout=r.timeout_ns;
++        if (timeout>5000000000ull) timeout=5000000000ull;
++        uint64_t began=mach_absolute_time(),limit=0;
++        nanoseconds_to_absolutetime(timeout,&limit);
++        for (;;) {
++            IOLockLock(gGPULock);bool done=sweet_gpu_done((uint32_t)r.fence);IOLockUnlock(gGPULock);
++            if (done) return kIOReturnSuccess;
++            if (timeout==0 || mach_absolute_time()-began>=limit) return kIOReturnTimeout;
++            delay_for_interval(1000,NSEC_PER_USEC);
++        }
++    }
++    if (method==NativeAdrenoMethodSubmit) {
++        NativeAdrenoAbiSubmit r;memcpy(&r,a->structureInput,sizeof r);
++        if (!r.buffer_count || r.buffer_count>NativeAdrenoAbiMaxBuffers || r.reserved || r.queue!=0 ||
++            (r.wait_fence==0 && r.wait_timeout_ns!=0) || r.wait_fence>UINT32_MAX) return kIOReturnBadArgument;
++        if (r.wait_fence) {
++            NativeAdrenoAbiWaitFence wait={r.wait_fence,r.wait_timeout_ns};
++            IOExternalMethodArguments nested={};nested.structureInput=&wait;nested.structureInputSize=sizeof wait;
++            IOReturn waited=call(NativeAdrenoMethodWaitFence,&nested);
++            if (waited!=kIOReturnSuccess) return waited;
++        }
++        uint64_t addresses[NativeAdrenoAbiMaxBuffers];uint32_t words[NativeAdrenoAbiMaxBuffers];
++        for (uint32_t i=0;i<r.buffer_count;i++) {
++            const NativeAdrenoAbiSubmitBuffer &entry=r.buffers[i];
++            native_memory_bo *b=find(entry.handle);
++            if (!b || !b->iova || entry.iova<b->iova || (entry.iova&3) || !entry.bytes || (entry.bytes&3) ||
++                entry.bytes/4>0xfffff || entry.iova-b->iova>=b->size || entry.bytes>b->size-(entry.iova-b->iova) ||
++                entry.iova<fWindow || entry.iova-fWindow>=nativeWindowSize || entry.bytes>nativeWindowSize-(entry.iova-fWindow))
++                return kIOReturnBadArgument;
++            addresses[i]=entry.iova;words[i]=(uint32_t)(entry.bytes/4);
++        }
++        IOLockLock(gGPULock);
++        sweet_gpu_to_memory(NULL,0);
++        uint32_t fence=sweet_gpu_submit(addresses,words,r.buffer_count);
++        if (fence) fLastFence=fence;
++        IOLockUnlock(gGPULock);
++        if (!fence) return kIOReturnBusy;
++        NativeAdrenoAbiSubmitReply reply={fence};memcpy(a->structureOutput,&reply,sizeof reply);
++        return kIOReturnSuccess;
+     }
+     if (method==NativeAdrenoMethodBoAlloc) {
+         NativeAdrenoAbiBoAlloc r;memcpy(&r,a->structureInput,sizeof r);
+@@ -178,7 +251,7 @@
+ /* Opt-in kernel-side smoke test of the diagnostic client. No command submission.
+  * Owns a private client and always releases its descriptors/window on exit. */
+ static IOReturn nativeTestCall(SweetNativeMemoryUserClient *c, uint32_t method,
+-    const void *in, size_t input, void *out, size_t output)
++    const void *in, uint32_t input, void *out, uint32_t output)
+ {
+     IOExternalMethodArguments args = {};
+     args.structureInput=in; args.structureInputSize=input;
