@@ -1,0 +1,102 @@
+--- a/iokit/Kernel/arm/SweetNativeMemory.inc
++++ b/iokit/Kernel/arm/SweetNativeMemory.inc
+@@ -1,8 +1,10 @@
+-/* Diagnostic NativeAdreno buffer bring-up. No submissions, imports, or Metal
+- * discovery are exposed here. Enable explicitly with sweetnativebuf=1.
++/* Diagnostic NativeAdreno buffer bring-up. Exposes only bounded buffer and
++ * command submission calls; import and Metal discovery are not ready yet.
++ * Enable explicitly with sweetnativebuf=1.
+  * Lock order: per-client lock, then gGPULock. Never the reverse. */
+ #include <pexpert/pexpert.h>
+ #include "NativeAdrenoABI.h"
++static uint32_t gpu_parity(uint32_t);
+ extern "C" bool sweet_gpu_address_reserve(uint64_t, uint64_t);
+ enum { NATIVE_SLOTS = 128 };
+ static const uint64_t nativeWindowSize = 256ull << 20;
+@@ -241,6 +243,77 @@
+ #undef NATIVE_TEST
+ }
+ 
++/* One private BO command through NativeAdreno ABI; no display objects. */
++static void nativeGpuBootTest(IOService *provider)
++{
++    unsigned enabled=0;
++    if (!PE_parse_boot_argn("sweetnativecheck",&enabled,sizeof enabled) || enabled!=1) return;
++    auto *c=OSTypeAlloc(SweetNativeMemoryUserClient);
++    bool attached=false,started=false;
++    IOMemoryDescriptor *ibMemory=NULL,*targetMemory=NULL;
++    const char *stage="init"; IOReturn status=kIOReturnError;
++    uint64_t window[2]={};
++    NativeAdrenoAbiParams params={}; NativeAdrenoAbiDeviceInfo info={};
++    NativeAdrenoAbiBoAlloc alloc={4096,12,0};
++    NativeAdrenoAbiBoAllocReply ib={},target={};
++    NativeAdrenoAbiBoMap mapping={}; NativeAdrenoAbiBoMapReply mapped={};
++    NativeAdrenoAbiSubmit submit={}; NativeAdrenoAbiSubmitReply submitted={};
++    NativeAdrenoAbiWaitFence wait={}; NativeAdrenoAbiBoFree release={};
++    IOOptionBits options=0;
++    if (!c || !c->initWithTask(kernel_task,NULL,0)) goto done;
++    attached=c->attach(provider); if (!attached) goto done;
++    started=c->start(provider); if (!started) goto done;
++#define NATIVE_GPU_TEST(call,label) do {stage=label;status=(call);if(status!=kIOReturnSuccess)goto done;}while(0)
++    NATIVE_GPU_TEST(nativeTestCall(c,0,NULL,0,window,sizeof window),"window");
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodQuery,NULL,0,&params,sizeof params),"query");
++    stage="ABI params";
++    if (params.abi_version!=NativeAdrenoAbiVersion || params.input_bits!=39 || params.output_bits!=36 ||
++        params.flags!=0 || params.max_bo_bytes!=nativeMaxBuffer) {status=kIOReturnError;goto done;}
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodGetDeviceInfo,NULL,0,&info,sizeof info),"device info");
++    stage="A650 info";
++    if (info.chip_id!=0x06050002 || info.gmem_bytes!=0x120000 || info.gmem_base!=0 ||
++        info.uche_trap_base!=0x1fffffffff000ull || info.va_start!=window[0] || info.va_size!=window[1] ||
++        info.highest_bank_bit!=16 || info.ubwc_swizzle!=6 || info.macrotile_mode!=1 || info.ubwc_version!=4 ||
++        info.flags!=NativeAdrenoDeviceClientIova || info.reserved) {status=kIOReturnError;goto done;}
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoAlloc,&alloc,sizeof alloc,&ib,sizeof ib),"alloc ib");
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoAlloc,&alloc,sizeof alloc,&target,sizeof target),"alloc target");
++    mapping.handle=ib.handle; mapping.iova=window[0]; mapping.permissions=3; mapping.shareability=2;
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoMap,&mapping,sizeof mapping,&mapped,sizeof mapped),"map ib");
++    if (mapped.iova!=mapping.iova) {stage="ib iova";status=kIOReturnError;goto done;}
++    mapping.handle=target.handle; mapping.iova=window[0]+4096;
++    NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodBoMap,&mapping,sizeof mapping,&mapped,sizeof mapped),"map target");
++    if (mapped.iova!=mapping.iova) {stage="target iova";status=kIOReturnError;goto done;}
++    NATIVE_GPU_TEST(c->clientMemoryForType((UInt32)ib.handle,&options,&ibMemory),"map ib cpu");
++    NATIVE_GPU_TEST(c->clientMemoryForType((UInt32)target.handle,&options,&targetMemory),"map target cpu");
++    {
++        auto *ibBuffer=OSDynamicCast(IOBufferMemoryDescriptor,ibMemory);
++        auto *targetBuffer=OSDynamicCast(IOBufferMemoryDescriptor,targetMemory);
++        stage="CPU buffers";
++        if (!ibBuffer || !targetBuffer || ibBuffer->getLength()<4096 || targetBuffer->getLength()<4096) {
++            status=kIOReturnError;goto done;
++        }
++        const uint32_t magic=0x5eedad50u;
++        volatile uint32_t *words=(volatile uint32_t *)ibBuffer->getBytesNoCopy();
++        words[0]=(7u<<28)|3u|(gpu_parity(3)<<15)|(0x3du<<16)|(gpu_parity(0x3du)<<23);
++        words[1]=(uint32_t)mapping.iova; words[2]=(uint32_t)(mapping.iova>>32); words[3]=magic;
++        sweet_gpu_to_memory((void *)ibBuffer->getBytesNoCopy(),16); sweet_gpu_to_memory(NULL,0);
++        submit.buffer_count=1; submit.queue=0; submit.buffers[0]={ib.handle,window[0],16};
++        NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodSubmit,&submit,sizeof submit,&submitted,sizeof submitted),"submit");
++        wait.fence=submitted.fence; wait.timeout_ns=2000000000ull;
++        NATIVE_GPU_TEST(nativeTestCall(c,NativeAdrenoMethodWaitFence,&wait,sizeof wait,NULL,0),"fence");
++        sweet_gpu_to_memory((void *)targetBuffer->getBytesNoCopy(),4); __asm__ volatile("dsb sy" ::: "memory");
++        stage="GPU writeback";
++        if (*(volatile uint32_t *)targetBuffer->getBytesNoCopy()!=magic) {status=kIOReturnError;goto done;}
++    }
++    stage="complete"; status=kIOReturnSuccess;
++done:
++    if (ibMemory) ibMemory->release(); if (targetMemory) targetMemory->release();
++    if (c) { if (started) c->stop(provider); if (attached) c->detach(provider); c->release(); }
++    IOLog("NATIVEABI: %s stage=%s status=%#x fence=%llu\n",status==kIOReturnSuccess?"PASS":"FAIL",
++        stage,status,(unsigned long long)submitted.fence);
++#undef NATIVE_GPU_TEST
++}
++
+ class SweetNativeMemory : public IOService {
+     OSDeclareDefaultStructors(SweetNativeMemory);
+ public:
+@@ -259,7 +332,7 @@
+     if (!service) return;
+     if (service->init() && service->attach(provider)) {
+         if (!service->start(provider)) service->detach(provider);
+-        else nativeMemoryBootTest(service);
++        else { nativeMemoryBootTest(service); nativeGpuBootTest(service); }
+     }
+     service->release();
+ }
