@@ -447,3 +447,8 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 ### 2026-11-08 CI retry note
 - The corrected patch passes `git apply --check` against the prior build tree. The retry then stopped before patch application/build because the remote KDK download was not a valid DMG (`hdiutil: attach failed - image not recognized`).
 - Updating the workflow's KDK curl to fail on HTTP errors and retry transient downloads before the next build.
+
+### 2026-11-08 — kernel/image 0113
+- Commit `c192ff5bdb152077394f7b2958183614b1784865` built successfully on CI run `42469485651`; build tree contains and compiles `SweetAccelerator.cpp` (`SweetAccelerator.cpd`). Kernel artifact `13613321621`, SHA256 `cfe5ac3beda05d268af6d3056f2f217984f1cbc561a252804a0e8a50d8246ea6`, 18,092,192 bytes; internal and archive checksums verified.
+- Created `D:\IOS On POCO GPT FILES\shim-alioth-0113-metal2-ioresources.img` (79,974,400 bytes; SHA256 `f4687b44970aaf52413bb25dd27d0f60462e232a9eeebf7975e1115ed60d42d2`). 0111 and incomplete 0112 files remain preserved.
+- `fastboot boot` accepted 0113. After 30 seconds neither ADB nor fastboot enumerated; USB is configured off for this image, so on-screen boot result still needs user confirmation. No partition was flashed or written.
