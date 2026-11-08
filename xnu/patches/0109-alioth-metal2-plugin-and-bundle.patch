@@ -50,7 +50,7 @@
  	IOLog("SweetGPU: registered: the GPU is offered to programs\n");
 --- a/bsd/dev/sweet_files.c
 +++ b/bsd/dev/sweet_files.c
-@@ -49,11 +49,19 @@
+@@ -49,11 +49,16 @@
  static const char *const allowed_files[] = {
      "/usr/local/lib/alioth-0096/libOSMesa.8.dylib",
      "/usr/local/lib/alioth-0096/libsweet-gl.dylib",
@@ -60,15 +60,12 @@
 +    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2",
 +    "/System/Library/Extensions/SweetMetal2.bundle/libvulkan_freedreno.dylib",
 +    "/System/Library/Extensions/SweetMetal2.bundle/_CodeSignature/CodeResources",
-+    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2.dSYM/Contents/Info.plist",
-+    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2.dSYM/Contents/Resources/DWARF/SweetMetal2",
-+    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2.dSYM/Contents/Resources/Relocations/aarch64/SweetMetal2.yml",
 +    "/var/local/mtl2-clients"
  };
  static bool sweet_file_allowed(const char *path)
  {
 -    for (unsigned i=0;i<3;i++) if (!strcmp(path,allowed_files[i])) return true;
-+    for (unsigned i=0;i<11;i++) if (!strcmp(path,allowed_files[i])) return true;
++    for (unsigned i=0;i<8;i++) if (!strcmp(path,allowed_files[i])) return true;
      return false;
  }
  
@@ -86,7 +83,7 @@
  	}
  	unsigned seen=0; bool failed=false;
 -	for (unsigned i = 0; i < 3; i++) {
-+	for (unsigned i = 0; i < 11; i++) {
++	for (unsigned i = 0; i < 8; i++) {
  		char name[16];
  		const void *prop = NULL;
  		unsigned int size = 0;
@@ -100,7 +97,7 @@
  		printf("SWEET FILES: %s: %zu bytes %s (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written", error);
  	}
 -	alioth_files_ready=seen==3 && !failed;
-+	alioth_files_ready=seen==11 && !failed;
++	alioth_files_ready=seen==8 && !failed;
  	if (alioth_files_ready) alioth_wallpaper_install(node);
  	printf("ALIGPU FILES: verified=%u ready=%u\n",seen,alioth_files_ready);
  }

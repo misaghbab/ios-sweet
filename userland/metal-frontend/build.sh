@@ -8,12 +8,12 @@ BRIDGE=$WORK/deps/bridge/libnative_metal_bridge.a
 TURNIP=$WORK/deps/turnip/libvulkan_freedreno.dylib
 mkdir -p "$WORK/include/bridge" "$OUT/SweetMetal2.bundle"
 echo "411b431660ab71a12c9478ecbefe88c890b6228cd82c00c96200dd711c2a1572  $BRIDGE" | shasum -a 256 -c -
-echo "c1f4d7ca892bf701bd10ae44660e88f4e373d489de1711a262cf9b5425a359c3  $TURNIP" | shasum -a 256 -c -
+echo "34bce03d2b0d15cc56ce83412a3e6743ec9889f33473f7f380153230333369b0  $TURNIP" | shasum -a 256 -c -
 cp "$ROOT"/userland/metal-bridge/*.h "$WORK/include/bridge/"
 SDK=$(xcrun --sdk iphoneos --show-sdk-path)
 CC=$(xcrun --sdk iphoneos --find clang)
 B=$OUT/SweetMetal2.bundle
-FLAGS=(-target arm64-apple-ios16.0 -isysroot "$SDK" -I"$HERE/include" -I"$WORK/include" -O2 -g -Wall)
+FLAGS=(-target arm64-apple-ios16.0 -isysroot "$SDK" -I"$HERE/include" -I"$WORK/include" -O2 -g0 -Wall)
 "$CC" "${FLAGS[@]}" -x objective-c++ -std=c++17 -fobjc-arc -Wno-deprecated-declarations -Wno-unused-function -bundle \
   -o "$B/SweetMetal2" "$HERE/SweetMetal2.mm" "$HERE/NativeBridgeMetalFrontend.mm" -x none "$BRIDGE" \
   -Wl,-dead_strip -lc++ -framework Foundation -framework Metal -framework IOSurface -framework IOKit -framework CoreFoundation 2>&1 | tee "$WORK/link.log"
@@ -25,6 +25,7 @@ for binary in "$B/SweetMetal2" "$B/libvulkan_freedreno.dylib" "$OUT/m2vtest"; do
   xcrun otool -L "$binary" >> "$WORK/dependencies.log"
   codesign --force --sign - "$binary"
 done
+rm -rf "$B/SweetMetal2.dSYM"
 codesign --force --sign - "$B"
 codesign --verify --strict "$B"
 codesign --verify --strict "$OUT/m2vtest"
