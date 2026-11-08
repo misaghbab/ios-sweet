@@ -438,3 +438,8 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - Log `metal-port-work/native-0111-device-log.txt`: Adreno 650 startup and GPU command/fence path passed; IOResources accelerator was instantiated, but no matching IOAcceleratorES provider was observed. This does not prove Metal device enumeration.
 - Local uncommitted change to `publish-0087/xnu/patches/0110-alioth-metal-ioresources-personality.patch`: share the IOAcceleratorES declaration via SweetAccelerator.h and derive SweetAccelerator from it, so Metal matching can see the service.
 - Next: verify patch ordering/build on CI; on success download as unique `native-kernel-0112` and create a separate temporary boot image. Use `fastboot boot`, never flash. Preserve 0111 and all existing files.
+
+### 2026-11-08 correction
+- CI run 42467207204 succeeded, but its build tree showed the patch was skipped: the SweetGPU hunk had the new header line as context rather than an added line. The resulting kernel did not contain the SweetAccelerator class, so it was not packaged into a boot image.
+- Corrected the unified-diff hunk. `git apply --check` now passes against SweetGPU.cpp, KernelConfigTables.cpp, and files.arm64 from that run's build tree.
+- Preserve the 0112 archive/download files from that ineffective build. The next CI build should be treated as kernel/image 0113. No phone partition was written.

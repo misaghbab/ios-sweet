@@ -64,7 +64,7 @@ diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
 index 15246bd9b..e2fb90081 100644
 --- a/iokit/Kernel/arm/SweetGPU.cpp
 +++ b/iokit/Kernel/arm/SweetGPU.cpp
-@@ -225,10 +225,6 @@
+@@ -225,9 +225,6 @@
  // Diagnostic buffer client; deliberately not the Metal accelerator service.
  #include "SweetNativeMemory.inc"
  
@@ -72,7 +72,7 @@ index 15246bd9b..e2fb90081 100644
 -{
 -	OSDeclareDefaultStructors(IOAcceleratorES);
 -};
- #include "SweetAccelerator.h"
++#include "SweetAccelerator.h"
  OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
  
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
