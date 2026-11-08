@@ -443,3 +443,7 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
 - CI run 42467207204 succeeded, but its build tree showed the patch was skipped: the SweetGPU hunk had the new header line as context rather than an added line. The resulting kernel did not contain the SweetAccelerator class, so it was not packaged into a boot image.
 - Corrected the unified-diff hunk. `git apply --check` now passes against SweetGPU.cpp, KernelConfigTables.cpp, and files.arm64 from that run's build tree.
 - Preserve the 0112 archive/download files from that ineffective build. The next CI build should be treated as kernel/image 0113. No phone partition was written.
+
+### 2026-11-08 CI retry note
+- The corrected patch passes `git apply --check` against the prior build tree. The retry then stopped before patch application/build because the remote KDK download was not a valid DMG (`hdiutil: attach failed - image not recognized`).
+- Updating the workflow's KDK curl to fail on HTTP errors and retry transient downloads before the next build.
