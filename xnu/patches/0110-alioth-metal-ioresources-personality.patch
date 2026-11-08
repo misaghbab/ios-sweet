@@ -1,0 +1,71 @@
+diff --git a/iokit/Kernel/arm/SweetAccelerator.cpp b/iokit/Kernel/arm/SweetAccelerator.cpp
+new file mode 100644
+index 000000000..37cda8e10
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccelerator.cpp
+@@ -0,0 +1,38 @@
++/* Publish an actual IOResources-matched accelerator for Metal.framework. */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <pexpert/pexpert.h>
++
++class SweetAccelerator : public IOService {
++	OSDeclareDefaultStructors(SweetAccelerator);
++public:
++	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetAccelerator, IOService);
++
++IOService *
++SweetAccelerator::probe(IOService *provider, SInt32 *score)
++{
++	uint32_t which = 0;
++	PE_parse_boot_argn("sweetmtl", &which, sizeof(which));
++	return which == 2 ? IOService::probe(provider, score) : NULL;
++}
++
++bool
++SweetAccelerator::start(IOService *provider)
++{
++	if (!IOService::start(provider))
++		return false;
++	setProperty("MetalPluginName", "SweetMetal2");
++	setProperty("MetalPluginClassName", "SweetMTL2Device");
++	setProperty("IOGLBundleName", "SweetMetal2");
++	setProperty("model", "Adreno 650");
++	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	registerService();
++	IOLog("SWEET MTL: IOResources accelerator personality published (SweetMetal2)\n");
++	return true;
++}
++#endif
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 92f3e265e..6c22c19d2 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -82,6 +82,11 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetAccelerator;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetAccelerator;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index acc9ae026..fb2450dcb 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -16,5 +16,6 @@
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/SweetAccelerator.cpp                            optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
