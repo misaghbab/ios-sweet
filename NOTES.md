@@ -431,3 +431,10 @@ What it took today (in order): 0058 HID services (Apple IOHIDFamily-1915 user cl
      cpu_init, before arm_vm_init.
   5. panic hook at top of panic_trap_to_debugger: va_copy + _doprnt(fmt, &copy, sweet_early_putc, 16).
   Verify with tools/xnu-cc.py (compile+symbols) and patch-order simulation before the single CI run.
+
+## Active handoff 2026-11-08 — Metal accelerator class registration
+
+- Device is in OrangeFox; last boot used temporary image `shim-alioth-0111-metal2-ioresources.img` and returned to recovery for a read-only persistent-log pull.
+- Log `metal-port-work/native-0111-device-log.txt`: Adreno 650 startup and GPU command/fence path passed; IOResources accelerator was instantiated, but no matching IOAcceleratorES provider was observed. This does not prove Metal device enumeration.
+- Local uncommitted change to `publish-0087/xnu/patches/0110-alioth-metal-ioresources-personality.patch`: share the IOAcceleratorES declaration via SweetAccelerator.h and derive SweetAccelerator from it, so Metal matching can see the service.
+- Next: verify patch ordering/build on CI; on success download as unique `native-kernel-0112` and create a separate temporary boot image. Use `fastboot boot`, never flash. Preserve 0111 and all existing files.

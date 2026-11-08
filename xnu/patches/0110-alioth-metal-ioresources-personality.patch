@@ -3,22 +3,23 @@ new file mode 100644
 index 000000000..37cda8e10
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAccelerator.cpp
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,40 @@
 +/* Publish an actual IOResources-matched accelerator for Metal.framework. */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOLib.h>
 +#include <IOKit/IOKitKeys.h>
 +#include <pexpert/pexpert.h>
++#include "SweetAccelerator.h"
 +
-+class SweetAccelerator : public IOService {
++class SweetAccelerator : public IOAcceleratorES {
 +	OSDeclareDefaultStructors(SweetAccelerator);
 +public:
 +	IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
 +	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 +};
 +
-+OSDefineMetaClassAndStructors(SweetAccelerator, IOService);
++OSDefineMetaClassAndStructors(SweetAccelerator, IOAcceleratorES);
 +
 +IOService *
 +SweetAccelerator::probe(IOService *provider, SInt32 *score)
@@ -43,6 +44,37 @@ index 000000000..37cda8e10
 +	return true;
 +}
 +#endif
+diff --git a/iokit/Kernel/arm/SweetAccelerator.h b/iokit/Kernel/arm/SweetAccelerator.h
+new file mode 100644
+index 000000000..b53f1010
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetAccelerator.h
+@@ -0,0 +1,10 @@
++#ifndef SWEET_ACCELERATOR_H
++#define SWEET_ACCELERATOR_H
++
++#include <IOKit/IOService.h>
++
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++#endif
+diff --git a/iokit/Kernel/arm/SweetGPU.cpp b/iokit/Kernel/arm/SweetGPU.cpp
+index 15246bd9b..e2fb90081 100644
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -225,10 +225,6 @@
+ // Diagnostic buffer client; deliberately not the Metal accelerator service.
+ #include "SweetNativeMemory.inc"
+ 
+-class IOAcceleratorES : public IOService
+-{
+-	OSDeclareDefaultStructors(IOAcceleratorES);
+-};
+ #include "SweetAccelerator.h"
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
 diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
 index 92f3e265e..6c22c19d2 100644
 --- a/iokit/KernelConfigTables.cpp
