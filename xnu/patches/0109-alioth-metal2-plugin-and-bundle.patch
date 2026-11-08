@@ -1,0 +1,106 @@
+--- a/iokit/Kernel/arm/SweetGPU.cpp
++++ b/iokit/Kernel/arm/SweetGPU.cpp
+@@ -38,6 +38,7 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOService.h>
++#include <pexpert/pexpert.h>
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/system.h>
+@@ -221,7 +222,13 @@
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
+-class SweetGPU : public IOService
++class IOAcceleratorES : public IOService
++{
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++class SweetGPU : public IOAcceleratorES
+ {
+ 	OSDeclareDefaultStructors(SweetGPU);
+ 
+@@ -229,7 +236,7 @@
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ };
+ 
+-OSDefineMetaClassAndStructors(SweetGPU, IOService);
++OSDefineMetaClassAndStructors(SweetGPU, IOAcceleratorES);
+ 
+ bool
+ SweetGPU::start(IOService *provider)
+@@ -238,6 +245,15 @@
+ 		return false;
+ 	}
+ 	setProperty(kIOUserClientClassKey, "SweetGPUUserClient");
++	uint32_t metal = 0;
++	PE_parse_boot_argn("sweetmtl", &metal, sizeof(metal));
++	if (metal == 2) {
++		setProperty("MetalPluginName", "SweetMetal2");
++		setProperty("MetalPluginClassName", "SweetMTL2Device");
++		setProperty("IOGLBundleName", "SweetMetal2");
++		setProperty("model", "Adreno 650");
++		IOLog("SWEET MTL: IOAcceleratorES published (MetalPluginName SweetMetal2)\n");
++	}
+ 	setName("SweetGPU");
+ 	registerService();
+ 	IOLog("SweetGPU: registered: the GPU is offered to programs\n");
+--- a/bsd/dev/sweet_files.c
++++ b/bsd/dev/sweet_files.c
+@@ -49,11 +49,19 @@
+ static const char *const allowed_files[] = {
+     "/usr/local/lib/alioth-0096/libOSMesa.8.dylib",
+     "/usr/local/lib/alioth-0096/libsweet-gl.dylib",
+-    "/usr/local/lib/alioth-0096/libsweet-ca.dylib"
++    "/usr/local/lib/alioth-0096/libsweet-ca.dylib",
++    "/System/Library/Extensions/SweetMetal2.bundle/Info.plist",
++    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2",
++    "/System/Library/Extensions/SweetMetal2.bundle/libvulkan_freedreno.dylib",
++    "/System/Library/Extensions/SweetMetal2.bundle/_CodeSignature/CodeResources",
++    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2.dSYM/Contents/Info.plist",
++    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2.dSYM/Contents/Resources/DWARF/SweetMetal2",
++    "/System/Library/Extensions/SweetMetal2.bundle/SweetMetal2.dSYM/Contents/Resources/Relocations/aarch64/SweetMetal2.yml",
++    "/var/local/mtl2-clients"
+ };
+ static bool sweet_file_allowed(const char *path)
+ {
+-    for (unsigned i=0;i<3;i++) if (!strcmp(path,allowed_files[i])) return true;
++    for (unsigned i=0;i<11;i++) if (!strcmp(path,allowed_files[i])) return true;
+     return false;
+ }
+ 
+@@ -105,7 +113,7 @@
+ {
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+-	int mode = strncmp(path, "/usr/local/", 11) == 0 ? 0755 : 0644;
++	int mode = (strncmp(path, "/usr/local/", 11) == 0 || strncmp(path, "/System/Library/Extensions/", 26) == 0) ? 0755 : 0644;
+ 	int error;
+ 
+ 	error = vnode_open(path, O_CREAT | O_EXCL | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
+@@ -167,7 +175,7 @@
+ 		return;
+ 	}
+ 	unsigned seen=0; bool failed=false;
+-	for (unsigned i = 0; i < 3; i++) {
++	for (unsigned i = 0; i < 11; i++) {
+ 		char name[16];
+ 		const void *prop = NULL;
+ 		unsigned int size = 0;
+@@ -184,11 +192,11 @@
+ 		}
+ 		const uint8_t *data = (const uint8_t *)prop + len + 1;
+ 		size_t bytes = size - len - 1;
+-		int error = bytes == 0 || bytes > (20u<<20) ? EINVAL : sweet_file_write(path, data, bytes);
++		int error = bytes == 0 || bytes > (32u<<20) ? EINVAL : sweet_file_write(path, data, bytes);
+ 		seen++; if (error) failed=true;
+ 		printf("SWEET FILES: %s: %zu bytes %s (error %d)\n", path, bytes, error == 0 ? "written" : "NOT written", error);
+ 	}
+-	alioth_files_ready=seen==3 && !failed;
++	alioth_files_ready=seen==11 && !failed;
+ 	if (alioth_files_ready) alioth_wallpaper_install(node);
+ 	printf("ALIGPU FILES: verified=%u ready=%u\n",seen,alioth_files_ready);
+ }
