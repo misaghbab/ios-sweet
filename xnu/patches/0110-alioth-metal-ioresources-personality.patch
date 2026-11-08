@@ -3,11 +3,12 @@ new file mode 100644
 index 000000000..37cda8e10
 --- /dev/null
 +++ b/iokit/Kernel/arm/SweetAccelerator.cpp
-@@ -0,0 +1,38 @@
+@@ -0,0 +1,39 @@
 +/* Publish an actual IOResources-matched accelerator for Metal.framework. */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <IOKit/IOService.h>
 +#include <IOKit/IOLib.h>
++#include <IOKit/IOKitKeys.h>
 +#include <pexpert/pexpert.h>
 +
 +class SweetAccelerator : public IOService {
